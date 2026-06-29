@@ -1,0 +1,17 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'rca-pilot-backend'
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - 'auth-service:8001'
+          - 'case-service:8002'
+          - 'evidence-service:8003'
+          - 'agent-service:8004'
+          - 'audit-service:8005'
+          - 'lms-connector:8011'
+        labels:
+          app: rca-pilot

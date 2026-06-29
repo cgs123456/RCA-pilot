@@ -1,0 +1,127 @@
+# RCA Pilot Backend — Python 项目配置
+# 大厂标准：ruff (lint+format) + mypy (类型) + pytest (测试) + coverage 阈值
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rca-pilot-backend"
+version = "1.0.0"
+description = "RCA Pilot — GxP Agentic AI 偏差调查平台后端"
+requires-python = ">=3.11"
+readme = "README.md"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["shared*", "auth_service*", "case_service*", "evidence_service*", "agent_service*", "audit_service*", "connectors*"]
+
+# ============================================================
+# Ruff — Lint + Format（取代 black + isort + flake8）
+# ============================================================
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = [
+    "alembic/versions",  # 自动生成的迁移文件
+]
+
+[tool.ruff.lint]
+# 启用规则集：
+# E/W = pycodestyle, F = pyflakes, I = isort, N = pep8-naming,
+# UP = pyupgrade, B = bugbear, SIM = simplify, C4 = comprehensions
+select = ["E", "W", "F", "I", "N", "UP", "B", "SIM", "C4"]
+ignore = [
+    "E501",   # 行宽由 formatter 处理
+    "B008",   # FastAPI Depends() 在默认参数中是惯用写法
+    "SIM117", # 嵌套 with 可读性优先
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402", "F401", "F811"]  # 测试文件允许未使用导入和延迟导入
+"alembic/*" = ["E402", "F401"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
+
+# ============================================================
+# Mypy — 静态类型检查
+# ============================================================
+[tool.mypy]
+python_version = "3.11"
+strict = false  # Phase 2 起步阶段不开 strict，逐步收紧
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false  # 现有代码大量无类型，先警告不报错
+check_untyped_defs = true
+ignore_missing_imports = true  # 第三方库无 stub 时跳过
+exclude = [
+    "alembic/versions",  # 自动生成
+]
+
+# 第三方库忽略
+[[tool.mypy.overrides]]
+module = ["passlib.*", "slowapi.*", "prometheus_client.*"]
+ignore_missing_imports = true
+
+# 测试文件放宽
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+
+# ============================================================
+# Pytest — 测试配置
+# ============================================================
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"  # pytest-asyncio 自动模式
+addopts = [
+    "-v",
+    "--strict-markers",
+    "--tb=short",
+    "--cov=shared",
+    "--cov=auth_service",
+    "--cov=case_service",
+    "--cov=evidence_service",
+    "--cov=agent_service",
+    "--cov=audit_service",
+    "--cov-report=term-missing",
+    "--cov-report=html:htmlcov",
+    "--cov-report=xml:coverage.xml",
+    "--cov-fail-under=80",  # 大厂标准：80% 行覆盖卡流水线
+]
+markers = [
+    "slow: 较慢的集成测试",
+    "integration: 需要 DB 的集成测试",
+    "unit: 纯单元测试",
+]
+
+# ============================================================
+# Coverage — 覆盖率配置
+# ============================================================
+[tool.coverage.run]
+source = ["shared", "auth_service", "case_service", "evidence_service", "agent_service", "audit_service"]
+omit = [
+    "*/tests/*",
+    "*/alembic/*",
+    "*/__init__.py",
+    "*/main.py",  # 入口文件不测
+]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+]
+fail_under = 80
+show_missing = true

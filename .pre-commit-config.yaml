@@ -1,0 +1,91 @@
+# ============================================================
+# pre-commit hooks 配置文件
+# 使用说明：
+#   1. 首次使用需安装 git hook： pre-commit install
+#   2. 手动全量扫描：        pre-commit run --all-files
+#   3. 更新 hook 版本：      pre-commit autoupdate
+# ============================================================
+repos:
+  # ----------------------------------------------------------
+  # 本地 Python hooks：ruff 静态检查/格式化 + mypy 类型检查
+  # ----------------------------------------------------------
+  - repo: local
+    hooks:
+      # ruff check：Rust 实现的极速 Python linter，--fix 自动修复可修复的问题
+      - id: ruff-check
+        name: ruff check (lint + autofix)
+        entry: ruff check --fix
+        language: system
+        types: [python]
+        files: ^backend/
+        pass_filenames: false
+      # ruff format：替代 black 的代码格式化工具，速度更快
+      - id: ruff-format
+        name: ruff format
+        entry: ruff format
+        language: system
+        types: [python]
+        files: ^backend/
+        pass_filenames: false
+      # mypy：静态类型检查，--ignore-missing-imports 跳过第三方库缺失类型声明
+      - id: mypy
+        name: mypy (type check)
+        entry: mypy
+        language: system
+        types: [python]
+        files: ^backend/
+        args: [--ignore-missing-imports]
+        pass_filenames: false
+
+  # ----------------------------------------------------------
+  # ESLint：前端 JavaScript/TypeScript 代码检查
+  # 额外依赖 eslint-config-react-hooks 用于 React Hooks 规则校验
+  # ----------------------------------------------------------
+  - repo: https://github.com/pre-commit/mirrors-eslint
+    rev: v9.0.0
+    hooks:
+      - id: eslint
+        files: ^frontend/src/.*\.(ts|tsx|js|jsx)$
+        types: [file]
+        additional_dependencies:
+          - eslint-config-react-hooks
+
+  # ----------------------------------------------------------
+  # Prettier：前端代码格式化（TS/TSX/CSS）
+  # ----------------------------------------------------------
+  - repo: https://github.com/pre-commit/mirrors-prettier
+    rev: v4.0.0
+    hooks:
+      - id: prettier
+        files: ^frontend/src/.*\.(ts|tsx|css)$
+        types: [file]
+
+  # ----------------------------------------------------------
+  # 通用代码质量 hooks：白空格、文件结尾、YAML/大文件/合并冲突/私钥检测
+  # ----------------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      # 清除行尾多余空白字符
+      - id: trailing-whitespace
+      # 确保文件以换行符结尾
+      - id: end-of-file-fixer
+      # 校验 YAML 语法正确性
+      - id: check-yaml
+      # 防止误提交大文件（>500KB）
+      - id: check-added-large-files
+        args: [--maxkb=500]
+      # 检测未解决的 git 合并冲突标记
+      - id: check-merge-conflict
+      # 检测私钥泄露（如 -----BEGIN RSA PRIVATE KEY-----）
+      - id: detect-private-key
+
+  # ----------------------------------------------------------
+  # detect-secrets：基于熵和正则的密钥扫描，baseline 模式可白名单已存在的误报
+  # 使用前需生成基线文件： detect-secrets scan > .secrets.baseline
+  # ----------------------------------------------------------
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args: [--baseline, .secrets.baseline]

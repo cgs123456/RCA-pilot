@@ -1,0 +1,207 @@
+# RCA Pilot — Docker Compose 单机部署
+# 用法：
+#   1. cp .env.example .env  修改配置
+#   2. docker compose up -d
+#   3. 访问 http://localhost:8080
+#
+# 首次启动后初始化数据库：
+#   docker compose --profile seed up seed
+#
+# 注意：Docker Compose v2+ 已废弃 version 字段，此处不再声明。
+
+services:
+  # ============================================================
+  # 数据层
+  # ============================================================
+  postgres:
+    image: postgres:15-alpine
+    container_name: rca-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-rca}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rca-secret}
+      POSTGRES_DB: ${POSTGRES_DB:-rca_pilot}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ../backend/db/01_schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rca}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: rca-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ============================================================
+  # 后端微服务
+  # ============================================================
+  auth-service:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    container_name: rca-auth
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SERVICE_NAME: auth-service
+    command: uvicorn auth_service.main:app --host 0.0.0.0 --port 8001
+    ports:
+      - "8001:8001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ../backend:/app/backend
+    working_dir: /app
+
+  case-service:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    container_name: rca-case
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SERVICE_NAME: case-service
+    command: uvicorn case_service.main:app --host 0.0.0.0 --port 8002
+    ports:
+      - "8002:8002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      auth-service:
+        condition: service_started
+    volumes:
+      - ../backend:/app/backend
+    working_dir: /app
+
+  evidence-service:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    container_name: rca-evidence
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SERVICE_NAME: evidence-service
+    command: uvicorn evidence_service.main:app --host 0.0.0.0 --port 8003
+    ports:
+      - "8003:8003"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ../backend:/app/backend
+    working_dir: /app
+
+  agent-service:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    container_name: rca-agent
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SERVICE_NAME: agent-service
+    command: uvicorn agent_service.main:app --host 0.0.0.0 --port 8004
+    ports:
+      - "8004:8004"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ../backend:/app/backend
+    working_dir: /app
+
+  audit-service:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    container_name: rca-audit
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SERVICE_NAME: audit-service
+    command: uvicorn audit_service.main:app --host 0.0.0.0 --port 8005
+    ports:
+      - "8005:8005"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ../backend:/app/backend
+    working_dir: /app
+
+  lms-connector:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    container_name: rca-lms-connector
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SERVICE_NAME: lms-connector
+    command: uvicorn connectors.lms.main:app --host 0.0.0.0 --port 8011
+    ports:
+      - "8011:8011"
+    volumes:
+      - ../backend:/app/backend
+    working_dir: /app
+
+  # ============================================================
+  # 前端
+  # ============================================================
+  frontend:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.frontend
+    container_name: rca-frontend
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    depends_on:
+      - auth-service
+      - case-service
+      - evidence-service
+      - agent-service
+      - audit-service
+
+  # ============================================================
+  # 数据库初始化（一次性运行）
+  # ============================================================
+  seed:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    container_name: rca-seed
+    env_file: .env
+    environment:
+      SERVICE_NAME: seed
+    command: python -m backend.seed
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ../backend:/app/backend
+    working_dir: /app
+    profiles: ["seed"]  # 仅在 docker-compose --profile seed up 时运行
+
+volumes:
+  postgres_data:
+  redis_data:

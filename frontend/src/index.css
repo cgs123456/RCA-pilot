@@ -1,0 +1,98 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================
+   RCA Pilot — Global Styles
+   保留 Demo 设计语言（Linear/Notion 风格）
+   ============================================ */
+
+* {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  font-family: 'Inter', system-ui, sans-serif;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  background: #F8FAFC;
+  color: #0F172A;
+}
+
+/* Scrollbars */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #E5E7EB; border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #CBD5E1; }
+* { scrollbar-width: thin; scrollbar-color: #E5E7EB transparent; }
+
+/* Severity colors */
+.sev-critical { color: #D72638; background: #FDECEE; }
+.sev-major    { color: #B81E2E; background: #FDECEE; }
+.sev-minor    { color: #D98106; background: #FEF3E2; }
+.sev-info     { color: #64748B; background: #F1F5F9; }
+
+.dot-critical { background: #D72638; }
+.dot-major    { background: #D72638; }
+.dot-minor    { background: #F59E0B; }
+.dot-info     { background: #64748B; }
+
+/* Source system colors */
+.src-lims  { background: #EEF4FF; color: #0B5FFF; }
+.src-mes   { background: #E6F4F0; color: #0E7C66; }
+.src-ems   { background: #FEF3E2; color: #D98106; }
+.src-cmms  { background: #F3E8FF; color: #7C3AED; }
+.src-lms   { background: #FDECEE; color: #B81E2E; }
+.src-bms   { background: #E0F2FE; color: #0284C7; }
+
+/* Card hover lift */
+.card-hover { transition: box-shadow 0.18s ease, transform 0.18s ease; }
+.card-hover:hover {
+  box-shadow: 0 4px 12px -2px rgb(15 23 42 / 0.08), 0 2px 6px -1px rgb(15 23 42 / 0.05);
+  transform: translateY(-1px);
+}
+
+/* Glass effect */
+.glass {
+  background: rgba(255, 255, 255, 0.85);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+/* Timeline */
+.timeline-line::before {
+  content: ''; position: absolute; left: 11px; top: 0; bottom: 0;
+  width: 2px; background: linear-gradient(to bottom, #E5E7EB 0%, #E5E7EB 100%);
+}
+.timeline-dot {
+  width: 12px; height: 12px; border-radius: 50%; border: 2px solid #fff;
+  box-shadow: 0 0 0 1px #E5E7EB; position: relative; z-index: 1;
+}
+.timeline-dot.anomaly {
+  background: #D72638; box-shadow: 0 0 0 1px #D72638;
+  animation: pulseRing 1.8s ease-out infinite;
+}
+
+/* Pulse danger (alert) */
+.pulse-danger { animation: pulseRing 1.8s ease-out infinite; }
+
+/* Shimmer skeleton */
+.shimmer {
+  background: linear-gradient(90deg, #F1F5F9 25%, #E5E7EB 50%, #F1F5F9 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s linear infinite;
+}
+
+@keyframes pulseRing {
+  0% { box-shadow: 0 0 0 0 rgba(215, 38, 56, 0.4); }
+  70% { box-shadow: 0 0 0 8px rgba(215, 38, 56, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(215, 38, 56, 0); }
+}
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
