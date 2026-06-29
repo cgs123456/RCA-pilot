@@ -1,5 +1,5 @@
 # RCA Pilot Backend Dockerfile — 通用镜像（所有微服务共用）
-FROM python:3.11-slim
+FROM python:3.14-slim
 
 # 设置工作目录
 WORKDIR /app
