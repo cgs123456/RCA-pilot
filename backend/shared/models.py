@@ -109,6 +109,10 @@ class Evidence(Base):
     content_hash: Mapped[str] = mapped_column(String(80), nullable=False)  # sha256:xxx
     confidence: Mapped[int] = mapped_column(Integer, default=3)  # 1-4
     is_signed: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 语义检索字段（Phase 2 新增）—— embedding 向量以 JSON 数组存储，避免引入 sqlite-vec/Chroma 依赖
+    embedding: Mapped[Optional[List[float]]] = mapped_column(JSONB, nullable=True)
+    embedding_model: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    embedded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
     case: Mapped[Optional["Deviation"]] = relationship("Deviation", back_populates="evidence")

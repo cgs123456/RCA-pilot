@@ -41,6 +41,24 @@ DEFAULT_FLAGS: Dict[str, Dict[str, Any]] = {
         "description": "Reasoner 使用 LLM 替代规则推理",
         "rollout_percentage": 0,
     },
+    # Evidence Hunter 语义检索（跨案例关联）
+    "evidence_hunter_semantic": {
+        "enabled": False,
+        "description": "Evidence Hunter 启用语义检索 + 跨案例关联（需 LLM embedding 配置）",
+        "rollout_percentage": 0,
+    },
+    # Drafter 使用 LLM 生成 ICH Q9 报告
+    "drafter_llm_enabled": {
+        "enabled": False,
+        "description": "Drafter 使用 LLM 生成 ICH Q9 格式报告（替代模板拼接）",
+        "rollout_percentage": 0,
+    },
+    # 多 Agent 博弈验证（Phase 2 改进5）
+    "multi_agent_debate_enabled": {
+        "enabled": False,
+        "description": "并行启动 2 个 Reasoner（primary + adversary）+ Skeptic 交叉质证 + Meta-Controller 综合置信度结论",
+        "rollout_percentage": 0,
+    },
     # 实时审计日志流（WebSocket）
     "realtime_audit_stream": {
         "enabled": False,

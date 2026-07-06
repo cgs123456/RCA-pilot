@@ -58,6 +58,9 @@ class Settings(BaseSettings):
     agent_service_port: int = 8004
     audit_service_port: int = 8005
     lms_connector_port: int = 8011
+    bms_connector_port: int = 8012
+    ems_connector_port: int = 8013
+    mes_connector_port: int = 8014
 
     # ---- 服务发现（Docker Compose 内服务名）----
     auth_service_url: str = "http://auth-service:8001"
@@ -66,6 +69,9 @@ class Settings(BaseSettings):
     agent_service_url: str = "http://agent-service:8004"
     audit_service_url: str = "http://audit-service:8005"
     lms_connector_url: str = "http://lms-connector:8011"
+    bms_connector_url: str = "http://bms-connector:8012"
+    ems_connector_url: str = "http://ems-connector:8013"
+    mes_connector_url: str = "http://mes-connector:8014"
 
     # ---- GxP 合规 ----
     audit_log_immutable: bool = True
@@ -74,9 +80,22 @@ class Settings(BaseSettings):
     retention_years: int = 10
 
     # ---- LLM (Phase 2 启用) ----
-    llm_provider: str = ""  # anthropic|openai|azure
+    # provider 支持：glm (智谱) | qwen (阿里通义) | openai | anthropic | azure | "" (禁用)
+    llm_provider: str = ""
     llm_api_key: str = ""
     llm_model: str = "claude-sonnet-4-20250514"
+    llm_base_url: str = ""  # 自定义 endpoint，留空则按 provider 选择默认值
+    llm_max_tokens: int = 2048
+    llm_temperature: float = 0.2  # Reasoner 推理温度，偏低保证可复现性
+    llm_timeout_seconds: int = 30  # HTTP 超时
+    llm_max_retries: int = 2  # 失败重试次数（指数退避）
+
+    # ---- LLM 多 Agent 博弈（Phase 2 改进5） ----
+    # 对抗 Reasoner 使用的 secondary LLM，留空则降级到单 Reasoner
+    llm_debate_provider: str = ""  # 对抗方 provider（如 qwen / openai）
+    llm_debate_api_key: str = ""
+    llm_debate_model: str = ""  # 留空则使用该 provider 的 default_model
+    llm_debate_temperature: float = 0.5  # 对抗方温度略高，鼓励多样性
 
     # ---- 可观测性 ----
     sentry_dsn: str = Field(default="", description="Sentry DSN，空则不初始化")
