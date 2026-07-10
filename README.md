@@ -2,7 +2,7 @@
 
 受 GxP 监管的 Agentic AI 偏差调查平台，面向生物制药企业提供端到端的根因分析能力。系统融合多 Agent 编排、HITL 人工决策门控、不可篡改审计链与 21 CFR Part 11 电子签名，支持从偏差告警接入到 ICH Q9 报告签发的完整闭环。
 
-> **Phase 2 更新（2026-07）**：6 项改进全部落地，Agent 流水线全面 LLM 化（Reasoner / Skeptic / Drafter 三大 Agent 接入 LLM Chain-of-Thought），新增多 Agent 博弈验证（双 Reasoner 并行 + Skeptic 交叉质证 + Meta-Controller 综合置信度），Evidence Hunter 升级语义检索 + 跨案例关联，Connector 扩展至 4 个（LMS + BMS + EMS + MES）。测试总数从 53 增长至 **202**（0 回归）。详见 [§ Phase 2 LLM 化改造](#phase-2-llm-化改造)。
+> **Phase 2 更新**：6 项改进全部落地，Agent 流水线全面 LLM 化（Reasoner / Skeptic / Drafter 三大 Agent 接入 LLM Chain-of-Thought），新增多 Agent 博弈验证（双 Reasoner 并行 + Skeptic 交叉质证 + Meta-Controller 综合置信度），Evidence Hunter 升级语义检索 + 跨案例关联，Connector 扩展至 4 个（LMS + BMS + EMS + MES）。测试总数从 53 增长至 **202**（0 回归）。详见 [§ Phase 2 LLM 化改造](#phase-2-llm-化改造)。
 
 ## 1. 项目概述
 
@@ -279,7 +279,6 @@ docker compose up -d
 # 首次初始化数据库种子数据
 docker compose --profile seed up seed
 
-# 访问 http://localhost:8080
 ```
 
 ### 方式二：本地开发
@@ -308,15 +307,13 @@ uvicorn connectors.lms.main:app --port 8011 --reload
 cd frontend
 npm install
 npm run dev
-# 访问 http://localhost:5173
 ```
 
 Demo 原型版（无需后端）：
 
 ```bash
 cd demo
-python -m http.server 8080
-# 访问 http://localhost:8080
+python -m 
 ```
 
 ### 运行测试
@@ -335,18 +332,6 @@ python -m pytest tests/ --tb=short --no-cov -q
 | QA 审核员 | james.wilson@biopharma.com | rca-demo-2025 |
 | 管理员 | admin@biopharma.com | rca-admin-2025 |
 
-## API 文档
-
-各服务启动后访问 Swagger UI：
-
-- Auth: http://localhost:8001/docs
-- Case: http://localhost:8002/docs
-- Evidence: http://localhost:8003/docs
-- Agent: http://localhost:8004/docs
-- Audit: http://localhost:8005/docs
-- LMS Connector: http://localhost:8011/docs
-
-所有业务 API 统一使用 `/api/v1/*` 前缀。
 
 ## GxP 合规要点
 
@@ -359,7 +344,7 @@ python -m pytest tests/ --tb=short --no-cov -q
 
 ## Phase 2 LLM 化改造
 
-2026 年 7 月完成 6 项改进，将 Agent 流水线从规则模板升级为真实 LLM 推理 + 多 Agent 博弈。所有改造均通过 Feature Flag 独立灰度，LLM 失败永不阻塞流水线（三级降级保护）。
+将 Agent 流水线从规则模板升级为真实 LLM 推理 + 多 Agent 博弈。所有改造均通过 Feature Flag 独立灰度，LLM 失败永不阻塞流水线（三级降级保护）。
 
 ### 改进总览
 
