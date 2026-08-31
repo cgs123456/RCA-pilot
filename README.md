@@ -2,10 +2,6 @@
 
 受 GxP 监管的 Agentic AI 偏差调查平台，面向生物制药企业提供端到端的根因分析能力。系统融合多 Agent 编排、HITL 人工决策门控、不可篡改审计链与 21 CFR Part 11 电子签名，支持从偏差告警接入到 ICH Q9 报告签发的完整闭环。
 
-> **Phase 2 更新（2026-07）**：6 项改进全部落地，Agent 流水线全面 LLM 化（Reasoner / Skeptic / Drafter 三大 Agent 接入 LLM Chain-of-Thought），新增多 Agent 博弈验证（双 Reasoner 并行 + Skeptic 交叉质证 + Meta-Controller 综合置信度），Evidence Hunter 升级语义检索 + 跨案例关联，Connector 扩展至 4 个（LMS + BMS + EMS + MES）。测试总数从 53 增长至 **218+**（Roadmap 36 任务完成后新增 30+ tests）（0 回归）。详见 [§ Phase 2 LLM 化改造](#phase-2-llm-化改造)。
-
-> **安全加固（2026-08）**：完成整库 code review 后逐项修复 P0/P1/P2 全部缺陷：修复多 Agent 博弈 new 客户端缺 `_http_clients` 连接池导致的运行时崩溃、ORM 双向关系缺失、Capa/Report/风险矩阵库表缺失（补齐 Alembic 迁移 + 初始 schema）、Docker healthcheck 语法错误；加固签名并发冲突（500→409）、登录"用户不存在"审计日志丢失 + 时序侧信道（伪 bcrypt 校验对齐耗时）、JWT `decode_token` 强制 `jti/sub/iat` 堵住吊销"放空"绕过；将 bcrypt cost 抽为配置项，`resolve_skeptic` 返回状态改为从实际 HITL 门控推导（不再硬编码脱钩）。测试 **218 passed, 0 failed**（0 回归）。
-
 ## 1. 项目概述
 
 RCA Pilot 围绕"偏差调查 4 小时交付可审计结构化草稿"的核心目标设计，主要特性包括：
@@ -439,18 +435,6 @@ RCA_FEATURE_FLAGS=reasoner_llm_enabled:100,skeptic_v2_enhanced:100,drafter_llm_e
 - Feature Flag：6 个 flag 已接入业务代码路径（`skeptic_v2_enhanced` / `reasoner_llm_enabled` / `hitl_gate3_auto_retry` / `evidence_hunter_semantic` / `drafter_llm_enabled` / `multi_agent_debate_enabled`），支持百分比灰度与环境变量热覆盖。
 - LLM 降级保护：所有 LLM 路径三级降级（flag off → rule-based；LLM 未配置 → rule-template-v1；LLM 异常 → fallback），LLM 失败永不阻塞 Agent 流水线。
 - GxP 审计：每个 LLM 调用写入 `ai_model` / `ai_prompt_hash` / `ai_output_hash` 到审计日志，满足可追溯性。
-
-## 安全加固（2026-08 code review）
-
-整库审查后按 P0/P1/P2 逐项修复，覆盖运行时崩溃、认证安全、并发一致性三大类：
-
-- **多 Agent 博弈运行时崩溃（P0）**：`LLMClient.from_override()` 绕过 `__init__` 未初始化 `_http_clients` 连接池缓存，首次网络调用即抛 `AttributeError`，导致 adversary 客户端必然降级为 `primary_only`。已在 `from_override` 补初始化 `weakref.WeakKeyDictionary`。
-- **ORM 库表漂移（P0）**：`Report.case` 的 `back_populates` 指向不存在的 `reports` 关系（mapper 报错）；`capas` / `reports` 表与 `deviations` 上 `risk_rpn` / `risk_category` / `risk_owner` 三字段缺迁移。已补齐 `20260830_0003_capa_report_risk.py` 迁移与 `01_schema.sql` 初始 schema，并移除 `Capa`/`Report.case_id` 上 `index=True` 与显式 `Index()` 重复声明造成的建表冲突。
-- **Docker healthcheck（P0）**：`compose` 健康检查内层 `f-string` 嵌套单引号在 Python 3.11- 触发 `SyntaxError`，改为字符串拼接。
-- **并发签名冲突（P1）**：`sign_case` 对同一用户重复签名原先在审计写入的 `flush` 阶段抛出未捕获 `IntegrityError` → 400/500，现提前 `flush` 捕获并返回 409 Conflict。
-- **登录时序侧信道 + 审计丢失（P1）**：`login` 端点对"用户不存在"分支执行一次真实 bcrypt 伪校验（`dummy_password_check`）对齐响应耗时，缓解账号枚举；并在抛错前 `commit`，确保失败尝试的审计日志不随事务回滚。
-- **JWT 吊销"放空"（P1）**：`decode_token` 强制要求 `jti` / `sub` / `iat` 三声明非空，否则视为无效 token，杜绝空 `jti` 跳过吊销检查的绕过路径；`/health` 相关连接池参数 `_pool_name` 在 SQLAlchemy 2.0.35 引发 `TypeError`，已移除。
-- **配置化与状态脱钩（P2）**：bcrypt cost 抽为 `BCRYPT_COST` 配置项（默认 12）；`resolve_skeptic` 返回的 `new_status` / `all_gates_passed` 改为从案例实际 HITL 门控读取，不再硬编码 `"investigating"` / `False`。
 
 ## 许可
 
