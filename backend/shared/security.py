@@ -33,7 +33,7 @@ def hash_password(password: str) -> str:
     """
     if len(password.encode("utf-8")) > _BCRYPT_MAX_BYTES:
         raise ValueError("密码长度超过 72 字节限制，请使用更短的密码")
-    salt = bcrypt.gensalt()
+    salt = bcrypt.gensalt(rounds=settings.bcrypt_cost)
     hashed = bcrypt.hashpw(_truncate(password), salt)
     return hashed.decode("utf-8")
 
@@ -45,6 +45,27 @@ def verify_password(plain: str, hashed: str | None) -> bool:
         return bcrypt.checkpw(_truncate(plain), hashed.encode("utf-8"))
     except (ValueError, TypeError):
         return False
+
+
+# 登录"用户不存在"分支的伪校验哈希 —— 首次使用时真实生成一次（保证结构合法），
+# 之后只校验固定占位串，让"存在/不存在"两条路径都走一遍完整 bcrypt，
+# 消除时间差，缓解账号枚举的时序侧信道。
+_DUMMY_HASH: str | None = None
+
+
+def _get_dummy_hash() -> str:
+    global _DUMMY_HASH
+    if _DUMMY_HASH is None:
+        _DUMMY_HASH = bcrypt.hashpw(
+            b"rca-timing-equalizer-secret",
+            bcrypt.gensalt(rounds=settings.bcrypt_cost),
+        ).decode("utf-8")
+    return _DUMMY_HASH
+
+
+def dummy_password_check(plain: str) -> None:
+    """对占位哈希执行一次真实 bcrypt 校验，仅用于对齐响应时间，结果被丢弃"""
+    verify_password(plain, _get_dummy_hash())
 
 
 # ---- JWT ----
@@ -93,6 +114,16 @@ def decode_token(token: str, expected_type: Literal["access", "refresh"] = "acce
         raise AuthError("Token 已过期，请重新登录", error_code=ErrorCode.TOKEN_EXPIRED.value) from None
     except jwt.InvalidTokenError as e:
         raise AuthError(f"Token 无效: {e}", error_code=ErrorCode.TOKEN_INVALID.value) from e
+
+    # 强制必需声明：jti（会话标识/吊销依据）、sub（主体）、iat（签发时间）。
+    # 缺失或为空的 token 一律视为无效 —— 否则调用方 `if jti and is_jti_revoked(jti)`
+    # 会因空 jti 跳过吊销检查（吊销"放空"），已登出/被禁用的会话仍能通过校验。
+    for claim in ("jti", "sub", "iat"):
+        if payload.get(claim) in (None, ""):
+            raise AuthError(
+                f"Token 缺少必需声明 '{claim}'",
+                error_code=ErrorCode.TOKEN_INVALID.value,
+            )
 
     if payload.get("type") != expected_type:
         raise AuthError(

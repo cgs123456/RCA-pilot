@@ -639,6 +639,17 @@ async def resolve_skeptic(
     sc.resolution = body.resolution
     sc.resolved_at = datetime.now(UTC)
 
+    # 加载案例以读取真实 HITL 关卡状态 —— 返回的 new_status/all_gates_passed
+    # 必须由实际状态推导，而非硬编码（此前写死 "investigating"/False，与模型脱钩）
+    case = (await db.execute(
+        select(Deviation).where(Deviation.id == case_id)
+    )).scalar_one_or_none()
+    if case is None:
+        raise NotFoundError(f"案例 {case_id} 不存在")
+    hitl = dict(case.hitl_gates or {})
+    all_passed = all(hitl.get(g) == "done" for g in HITL_GATES)
+    new_status = "reviewing" if all_passed else case.status
+
     await append_audit_log(
         db,
         operator=auth.email,
@@ -653,8 +664,8 @@ async def resolve_skeptic(
         case_id=case_id,
         gate_id="gate3",
         action="accept" if body.status == "accepted" else "reject",
-        new_status="investigating",
-        all_gates_passed=False,
+        new_status=new_status,
+        all_gates_passed=all_passed,
         triggered_agent=None,
     )
 
@@ -773,6 +784,17 @@ async def sign_case(
         case.progress = 100
         case.closed_at = signed_at
 
+    # 先单独 flush sig 并捕获主键/唯一约束冲突 -> 返回 409 而非 500。
+    # 注意：不能在写审计之后才 try/except —— append_audit_log 内部会再 flush
+    # 一次并提前把 sig 的 IntegrityError 抛出来，导致下方 409 分支成为不可达死代码。
+    try:
+        await db.flush()
+    except IntegrityError as e:
+        raise ConflictError(
+            "签名记录冲突（同一用户不可对同一案例重复签署）",
+            error_code=ErrorCode.SIGNATURE_REQUIRED.value,
+        ) from e
+
     await append_audit_log(
         db,
         operator=auth.email,
@@ -787,13 +809,6 @@ async def sign_case(
         session_id=auth.session_id,
     )
 
-    try:
-        await db.flush()
-    except IntegrityError as e:
-        raise ConflictError(
-            "签名记录冲突（同一用户不可对同一案例重复签署）",
-            error_code=ErrorCode.SIGNATURE_REQUIRED.value,
-        ) from e
     return SignatureOut.model_validate(sig)
 
 

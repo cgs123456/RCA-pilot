@@ -608,7 +608,7 @@ class TestEvidenceHunterSemantic:
         """嵌入失败时审计日志应被回滚或记录错误"""
         from agent_service.routes import _run_evidence_hunter
         from shared.audit import append_audit_log
-        from shared.exceptions import LLMError
+        from shared.llm_client import LLMError
 
         # 给案例添加证据
         from shared.models import Evidence
@@ -637,6 +637,18 @@ class TestEvidenceHunterSemantic:
         )
         test_db.add(case)
         await test_db.commit()
+
+        # 重新加载案例，预加载关系（_run_evidence_hunter 会同步访问 case.evidence，
+        # 未加载的关系在 async 上下文中惰性加载会抛 MissingGreenlet）
+        from sqlalchemy import select
+        from sqlalchemy.orm import selectinload
+        case = (
+            await test_db.execute(
+                select(Deviation)
+                .where(Deviation.id == "DEV-ROLLBACK-001")
+                .options(selectinload(Deviation.evidence), selectinload(Deviation.five_whys))
+            )
+        ).scalar_one()
 
         # LLM 故障：embed_text 抛出异常
         mock_llm = MagicMock()

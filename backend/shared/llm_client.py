@@ -202,6 +202,10 @@ class LLMClient:
         instance._temperature = temperature if temperature is not None else settings.llm_temperature
         instance._timeout = float(settings.llm_timeout_seconds)
         instance._max_retries = settings.llm_max_retries
+        # 必须初始化连接池缓存：from_override 绕过 __init__，缺此字段会在
+        # _get_http_client 首次访问 self._http_clients 时抛 AttributeError，
+        # 导致多 Agent 博弈的 adversary 客户端必然降级为 primary_only。
+        instance._http_clients = weakref.WeakKeyDictionary()
         instance._resolve_provider_defaults()
         return instance
 

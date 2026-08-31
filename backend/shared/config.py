@@ -51,6 +51,8 @@ class Settings(BaseSettings):
     mfa_required: bool = False
     # 会话锁定：连续失败锁定时长（分钟），0 表示永久锁定（不推荐）
     account_lockout_minutes: int = 15
+    # bcrypt 哈希成本因子（2^cost 轮）。生产建议 12，测试/CI 可调低加速
+    bcrypt_cost: int = Field(default=12, description="bcrypt 哈希成本因子（rounds=2^cost）")
     # 服务间调用密钥（case→agent 内部触发、connector 鉴权）；prod 必填
     service_api_key: str = Field(default="", description="服务间调用密钥，prod 必须配置")
     # 可信代理：True 时才信任 X-Forwarded-For / X-Real-IP（部署在 Nginx 后且由 compose/网关固定时开启）

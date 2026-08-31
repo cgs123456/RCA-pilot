@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 pytestmark = pytest.mark.asyncio
@@ -131,6 +132,7 @@ class TestSignatureOrder:
         """越权测试：QA 批准前必须存在投稿者的 submit 记录，否则拒绝"""
         from case_service.routes import sign_case
         from shared.exceptions import ValidationError
+        from shared.models import Deviation
 
         test_db.add(self._make_case("DEV-SIG-010"))
         investigator, qa = seed_db[0], seed_db[1]

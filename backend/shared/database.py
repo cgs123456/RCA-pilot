@@ -20,8 +20,6 @@ engine = create_async_engine(
     max_overflow=10,
     pool_pre_ping=True,
     pool_recycle=1800,
-    # 连接池监控：暴露池状态供 Prometheus 指标采集
-    _pool_name="rca-pilot-db",
 )
 
 AsyncSessionLocal = async_sessionmaker(

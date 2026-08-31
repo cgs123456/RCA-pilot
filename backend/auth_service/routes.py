@@ -31,6 +31,7 @@ from shared.security import (
     create_access_token,
     create_refresh_token,
     decode_token,
+    dummy_password_check,
     is_jti_revoked,
     revoke_jti,
     verify_password,
@@ -71,8 +72,12 @@ async def login(
 
     ip = get_client_ip(request)
 
-    # 用户不存在 — 统一错误信息防止枚举
+    # 用户不存在 — 先做一次真实 bcrypt 伪校验，对齐"密码错误"分支的响应耗时，
+    # 消除账号枚举的时序侧信道；同时提交审计日志（append_audit_log 内部会 flush，
+    # 但后续 raise 会触发整个会话回滚，必须先 commit 才能持久化）。
     if not user:
+        # 放线程池执行 bcrypt，避免阻塞事件循环
+        await anyio.to_thread.run_sync(dummy_password_check, body.password)
         await append_audit_log(
             db,
             operator=body.email,
@@ -81,6 +86,7 @@ async def login(
             detail=f"用户不存在 (ip={ip})",
             ip_address=ip,
         )
+        await db.commit()
         raise AuthError("邮箱或密码错误")
 
     if not user.is_active:

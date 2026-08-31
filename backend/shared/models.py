@@ -104,6 +104,7 @@ class Deviation(Base):
     five_whys: Mapped[list[FiveWhy]] = relationship("FiveWhy", back_populates="case", lazy="select", cascade="all, delete-orphan", order_by="FiveWhy.n")
     skeptic_challenges: Mapped[list[SkepticChallenge]] = relationship("SkepticChallenge", back_populates="case", lazy="select", cascade="all, delete-orphan")
     capas: Mapped[list["Capa"]] = relationship("Capa", back_populates="case", lazy="select", cascade="all, delete-orphan")  # type: ignore[misc]
+    reports: Mapped[list["Report"]] = relationship("Report", back_populates="case", lazy="select", cascade="all, delete-orphan")  # type: ignore[misc]
 
     __table_args__ = (
         Index("ix_deviations_status_severity", "status", "severity"),
@@ -308,7 +309,9 @@ class Capa(Base):
     __tablename__ = "capas"
 
     id: Mapped[str] = mapped_column(String(50), primary_key=True)
-    case_id: Mapped[str] = mapped_column(String(32), ForeignKey("deviations.id"), index=True, nullable=False)
+    # case_id 不设 index=True —— __table_args__ 已有显式 Index("ix_capas_case_id")，
+    # 两者同名会令 create_all 对同一索引创建两次而报 "index already exists"。
+    case_id: Mapped[str] = mapped_column(String(32), ForeignKey("deviations.id"), nullable=False)
     title: Mapped[str] = mapped_column(String(500), nullable=False)  # CAPA 标题/描述
     description: Mapped[str | None] = mapped_column(Text)  # 详细描述
     severity: Mapped[str] = mapped_column(String(20), nullable=False)  # critical|major|minor|info
@@ -341,7 +344,9 @@ class Report(Base):
     __tablename__ = "reports"
 
     id: Mapped[str] = mapped_column(String(50), primary_key=True)
-    case_id: Mapped[str] = mapped_column(String(32), ForeignKey("deviations.id"), index=True, nullable=False)
+    # case_id 不设 index=True —— __table_args__ 已有显式 Index("ix_reports_case_id")，
+    # 两者同名会令 create_all 对同一索引创建两次而报 "index already exists"。
+    case_id: Mapped[str] = mapped_column(String(32), ForeignKey("deviations.id"), nullable=False)
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)  # 版本号，每次变更 +1
     title: Mapped[str] = mapped_column(String(500), nullable=False)  # 报告标题
     content: Mapped[str] = mapped_column(Text, nullable=False)  # Markdown 内容（含 ```markdown ``` 围栏）

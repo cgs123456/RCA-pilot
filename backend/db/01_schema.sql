@@ -79,6 +79,10 @@ CREATE TABLE IF NOT EXISTS deviations (
     closed_at       TIMESTAMPTZ,
     hitl_gates      JSONB NOT NULL DEFAULT '{}'::jsonb,
     meta            JSONB NOT NULL DEFAULT '{}'::jsonb,
+    -- ICH Q9 风险矩阵（FMEA/RPN）
+    risk_rpn        INTEGER CHECK (risk_rpn BETWEEN 1 AND 1000),
+    risk_category   VARCHAR(20) CHECK (risk_category IN ('critical','high','medium','low')),
+    risk_owner      VARCHAR(32) REFERENCES users(id),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -294,3 +298,48 @@ COMMENT ON TABLE audit_log IS 'GxP 审计日志 — 不可篡改，DB 触发器�
 COMMENT ON COLUMN audit_log.current_hash IS 'sha256(v2|prev_hash|seq|operator|action|target|detail|ts|evidence_refs|ip|session|ai_model|ai_prompt_hash|ai_output_hash|trace_id)';
 COMMENT ON COLUMN evidence.content_hash IS 'sha256(raw_data_json_normalized)';
 COMMENT ON TABLE deviations IS '偏差案例主表';
+
+-- ============================================================
+--  CAPA（纠正预防措施）— GxP 合规必备
+-- ============================================================
+CREATE TABLE IF NOT EXISTS capas (
+    id                 VARCHAR(50) PRIMARY KEY,
+    case_id            VARCHAR(32) NOT NULL REFERENCES deviations(id),
+    title              VARCHAR(500) NOT NULL,
+    description        TEXT,
+    severity           VARCHAR(20) NOT NULL CHECK (severity IN ('critical','major','minor','info')),
+    status             VARCHAR(30) NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending','under_review','implemented','verified','closed')),
+    responsibility     VARCHAR(100) NOT NULL,
+    due_date           TIMESTAMPTZ,
+    verified_by        VARCHAR(32) REFERENCES users(id),
+    verified_at        TIMESTAMPTZ,
+    effectiveness_rate INTEGER CHECK (effectiveness_rate BETWEEN 0 AND 100),
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_capas_case_id ON capas(case_id);
+CREATE INDEX IF NOT EXISTS ix_capas_status ON capas(status);
+CREATE INDEX IF NOT EXISTS ix_capas_due_date ON capas(due_date);
+
+-- ============================================================
+--  ICH Q9 十节格式报告（版本化管理，受 GxP 文件控制）
+-- ============================================================
+CREATE TABLE IF NOT EXISTS reports (
+    id              VARCHAR(50) PRIMARY KEY,
+    case_id         VARCHAR(32) NOT NULL REFERENCES deviations(id),
+    version         INTEGER NOT NULL DEFAULT 1,
+    title           VARCHAR(500) NOT NULL,
+    content         TEXT NOT NULL,
+    status          VARCHAR(30) NOT NULL DEFAULT 'draft'
+        CHECK (status IN ('draft','under_review','approved','rejected')),
+    author_id       VARCHAR(32) NOT NULL REFERENCES users(id),
+    approved_by     VARCHAR(32) REFERENCES users(id),
+    approved_at     TIMESTAMPTZ,
+    change_reason   TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT reports_case_version_uniq UNIQUE (case_id, version)
+);
+CREATE INDEX IF NOT EXISTS ix_reports_case_id ON reports(case_id);
+CREATE INDEX IF NOT EXISTS ix_reports_status ON reports(status);

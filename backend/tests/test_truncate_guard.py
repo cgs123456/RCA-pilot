@@ -15,17 +15,17 @@ pytestmark = pytest.mark.asyncio
 
 async def test_truncate_blocked_by_trigger(test_db: AsyncSession):
     """直接 TRUNCATE 应被触发器阻止，返回明确错误"""
-    from shared.models import AuditLog
+    # 用 append_audit_log 构造日志（自动填充 log_id/prev_hash/current_hash，
+    # 这些字段 NOT NULL，直接构造 AuditLog 会漏填导致插入失败）
+    from shared.audit import append_audit_log
 
-    # 先插入一些日志
-    log = AuditLog(
-        seq=1,
+    await append_audit_log(
+        test_db,
         operator="tester",
         action="TEST",
         target="case-1",
         detail="test detail",
     )
-    test_db.add(log)
     await test_db.flush()
 
     # 尝试 TRUNCATE - 应该被触发器阻止
@@ -40,19 +40,17 @@ async def test_truncate_blocked_by_trigger(test_db: AsyncSession):
             f"错误信息应包含 TRUNCATE/blocked 提示，得到: {error_msg}"
 
 
-async def test_truncate_via_safe_mode_succeeds(test_db: AsyncSession, admin_user):
+async def test_truncate_via_safe_mode_succeeds(test_db: AsyncSession):
     """superuser/管理模式下可通过安全流程执行 TRUNCATE"""
-    from shared.models import AuditLog
+    from shared.audit import append_audit_log
 
-    # 先插入一些日志
-    log = AuditLog(
-        seq=1,
+    await append_audit_log(
+        test_db,
         operator="tester",
         action="TEST",
         target="case-1",
         detail="test detail",
     )
-    test_db.add(log)
     await test_db.flush()
 
     # 使用管理模式的安全 TRUNCATE（通过函数调用而非直接 TRUNCATE）
@@ -70,18 +68,17 @@ async def test_truncate_via_safe_mode_succeeds(test_db: AsyncSession, admin_user
 
 async def test_audit_logs_remain_integrated_after_migration(test_db: AsyncSession):
     """迁移执行后，审计链应保持完整"""
-    from shared.audit import verify_hash_chain
+    from shared.audit import append_audit_log, verify_hash_chain
 
-    # 插入几条日志
+    # 用 append_audit_log 正确构造 hash 链（直接构造 AuditLog 不会填 prev_hash/current_hash）
     for i in range(3):
-        log = AuditLog(
-            seq=i + 1,
+        await append_audit_log(
+            test_db,
             operator=f"u{i}",
             action=f"A{i}",
             target=f"t{i}",
             detail=f"d{i}",
         )
-        test_db.add(log)
     await test_db.flush()
     await test_db.commit()
 
