@@ -61,7 +61,7 @@ jobs:
         env:
           PYTHONPATH: backend
           # 使用 SQLite in-memory，覆盖默认 Postgres 配置
-          DATABASE_URL: sqlite:///:memory:
+          DATABASE_URL: "sqlite:///:memory:"
           ENV: test
           JWT_SECRET: ci-test-secret
           REDIS_ENABLED: "false"
