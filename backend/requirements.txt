@@ -15,7 +15,7 @@ sqlalchemy[asyncio]==2.0.35
 asyncpg==0.29.0
 aiosqlite==0.20.0           # SQLAlchemy async SQLite 驱动（CI 测试用）
 psycopg2-binary==2.9.9  # Alembic + seed 同步模式
-alembic==1.13.3         # 版本化迁移
+alembic==1.19.1         # 版本化迁移
 redis==5.2.1            # jti 黑名单 + 限流共享存储（不可用时自动降级）
 
 # ============================================================
