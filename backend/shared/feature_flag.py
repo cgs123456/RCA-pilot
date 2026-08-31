@@ -16,9 +16,9 @@
 """
 from __future__ import annotations
 
+import copy  # noqa: F401
 import json
 import os
-import copy  # noqa: F401
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -190,7 +190,7 @@ def is_enabled(
     # 百分比灰度
     rollout = flag.get("rollout_percentage", 100)
     # 验证 rollout_percentage 合法性（0-100）
-    if not isinstance(rollout, (int, float)) or rollout < 0 or rollout > 100:
+    if not isinstance(rollout, int | float) or rollout < 0 or rollout > 100:
         raise ValueError(f"Feature flag {flag_name} rollout_percentage 必须为 0-100 之间的数值，当前值: {rollout}")
     if rollout >= 100:
         return True

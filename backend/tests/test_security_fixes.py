@@ -135,7 +135,7 @@ class TestSignatureOrder:
         from shared.models import Deviation
 
         test_db.add(self._make_case("DEV-SIG-010"))
-        investigator, qa = seed_db[0], seed_db[1]
+        _investigator, qa = seed_db[0], seed_db[1]
         await test_db.commit()
         case = (await test_db.execute(select(Deviation).where(Deviation.id == "DEV-SIG-010"))).scalar_one()
         case.status = "reviewing"

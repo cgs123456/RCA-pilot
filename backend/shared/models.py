@@ -103,8 +103,8 @@ class Deviation(Base):
     timeline: Mapped[list[TimelineEvent]] = relationship("TimelineEvent", back_populates="case", lazy="select", cascade="all, delete-orphan", order_by="TimelineEvent.occurred_at")
     five_whys: Mapped[list[FiveWhy]] = relationship("FiveWhy", back_populates="case", lazy="select", cascade="all, delete-orphan", order_by="FiveWhy.n")
     skeptic_challenges: Mapped[list[SkepticChallenge]] = relationship("SkepticChallenge", back_populates="case", lazy="select", cascade="all, delete-orphan")
-    capas: Mapped[list["Capa"]] = relationship("Capa", back_populates="case", lazy="select", cascade="all, delete-orphan")  # type: ignore[misc]
-    reports: Mapped[list["Report"]] = relationship("Report", back_populates="case", lazy="select", cascade="all, delete-orphan")  # type: ignore[misc]
+    capas: Mapped[list[Capa]] = relationship("Capa", back_populates="case", lazy="select", cascade="all, delete-orphan")  # type: ignore[misc]
+    reports: Mapped[list[Report]] = relationship("Report", back_populates="case", lazy="select", cascade="all, delete-orphan")  # type: ignore[misc]
 
     __table_args__ = (
         Index("ix_deviations_status_severity", "status", "severity"),

@@ -32,7 +32,7 @@ async def test_truncate_blocked_by_trigger(test_db: AsyncSession):
     try:
         await test_db.execute(text("TRUNCATE TABLE audit_log"))
         await test_db.commit()
-        assert False, "TRUNCATE 应该被触发器阻止"
+        raise AssertionError("TRUNCATE 应该被触发器阻止")
     except Exception as e:
         error_msg = str(e)
         # 应该包含提示信息，指引使用安全模式
@@ -57,7 +57,7 @@ async def test_truncate_via_safe_mode_succeeds(test_db: AsyncSession):
     # 这模拟了 migration 脚本使用的模式
     try:
         # 尝试通过安全函数执行
-        result = await test_db.execute(
+        await test_db.execute(
             text("SELECT shared.safe_truncate_audit_log()")
         )
         # 如果函数不存在，则跳过或记录
