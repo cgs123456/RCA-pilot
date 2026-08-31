@@ -8,14 +8,13 @@
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.models import Deviation, Evidence
-
 
 pytestmark = pytest.mark.asyncio
 
@@ -33,7 +32,7 @@ async def semantic_case(test_db: AsyncSession, seed_db):
         description="B 级背景区沉降菌采样 22 CFU",
         severity="major",
         status="investigating",
-        discovered_at=datetime.now(timezone.utc),
+        discovered_at=datetime.now(UTC),
         investigator_id="U-LC",
         progress=20,
         hitl_gates={"gate1": "pending", "gate2": "pending", "gate3": "pending", "gate4": "pending", "gate5": "pending"},
@@ -45,7 +44,7 @@ async def semantic_case(test_db: AsyncSession, seed_db):
         description="2024 年类似 HVAC 差压异常导致沉降菌超标",
         severity="major",
         status="closed",
-        discovered_at=datetime(2024, 8, 15, tzinfo=timezone.utc),
+        discovered_at=datetime(2024, 8, 15, tzinfo=UTC),
         investigator_id="U-OLD",
         progress=100,
         hitl_gates={"gate1": "passed", "gate2": "passed", "gate3": "passed", "gate4": "passed", "gate5": "passed"},
@@ -59,7 +58,7 @@ async def semantic_case(test_db: AsyncSession, seed_db):
             id="E-SEM-01",
             case_id="DEV-SEM-001",
             source_system="LMS",
-            collected_at=datetime.now(timezone.utc),
+            collected_at=datetime.now(UTC),
             summary="EMP-2187 更衣资质逾期",
             raw_data={},
             content_hash="sha256:sem-1",
@@ -69,7 +68,7 @@ async def semantic_case(test_db: AsyncSession, seed_db):
             id="E-SEM-02",
             case_id="DEV-SEM-001",
             source_system="BMS",
-            collected_at=datetime.now(timezone.utc),
+            collected_at=datetime.now(UTC),
             summary="AHU-7 差压 470 Pa 超过预警值",
             raw_data={},
             content_hash="sha256:sem-2",
@@ -82,7 +81,7 @@ async def semantic_case(test_db: AsyncSession, seed_db):
             id="E-HIST-01",
             case_id="DEV-HIST-001",
             source_system="BMS",
-            collected_at=datetime(2024, 8, 14, tzinfo=timezone.utc),
+            collected_at=datetime(2024, 8, 14, tzinfo=UTC),
             summary="AHU-7 差压历史异常，HVAC 故障",
             raw_data={},
             content_hash="sha256:hist-1",
@@ -92,7 +91,7 @@ async def semantic_case(test_db: AsyncSession, seed_db):
             id="E-HIST-02",
             case_id="DEV-HIST-001",
             source_system="LMS",
-            collected_at=datetime(2024, 8, 14, tzinfo=timezone.utc),
+            collected_at=datetime(2024, 8, 14, tzinfo=UTC),
             summary="EMP-1234 更衣资质历史逾期",
             raw_data={},
             content_hash="sha256:hist-2",
@@ -109,7 +108,7 @@ async def semantic_case(test_db: AsyncSession, seed_db):
     result = await test_db.execute(
         select(Deviation)
         .where(Deviation.id == "DEV-SEM-001")
-        .options(selectinload(Deviation.evidence))
+        .options(selectinload(Deviation.evidence), selectinload(Deviation.five_whys))
     )
     return result.scalar_one()
 
@@ -604,3 +603,55 @@ class TestEvidenceHunterSemantic:
         assert "gaps" in result
         assert "ai_output_hash" in result
         assert result["ai_output_hash"].startswith("sha256:")
+
+    async def test_embedding_audit_rollback_on_failure(self, test_db: AsyncSession):
+        """嵌入失败时审计日志应被回滚或记录错误"""
+        from agent_service.routes import _run_evidence_hunter
+        from shared.audit import append_audit_log
+        from shared.exceptions import LLMError
+
+        # 给案例添加证据
+        from shared.models import Evidence
+        ev = Evidence(
+            id="E-ROLLBACK-001",
+            case_id="DEV-ROLLBACK-001",
+            source_system="TEST",
+            collected_at=datetime.now(UTC),
+            summary="Rollback test evidence",
+            raw_data={},
+            content_hash="sha256:rollback",
+            confidence=3,
+        )
+        test_db.add(ev)
+        await test_db.commit()
+
+        # 创建一个最小案例
+        from shared.models import Deviation
+        case = Deviation(
+            id="DEV-ROLLBACK-001",
+            title="回滚测试案例",
+            severity="minor",
+            status="investigating",
+            discovered_at=datetime.now(UTC),
+            investigator_id="U-LC",
+        )
+        test_db.add(case)
+        await test_db.commit()
+
+        # LLM 故障：embed_text 抛出异常
+        mock_llm = MagicMock()
+        mock_llm.supports_embeddings = True
+        mock_llm.embed_text = AsyncMock(side_effect=LLMError("embedding service unavailable"))
+
+        with patch("shared.feature_flag.is_enabled", return_value=True), \
+             patch("shared.llm_client.llm_client", mock_llm):
+            result = await _run_evidence_hunter(test_db, case)
+
+        # 流水线应降级并完成，不应因 LLM 故障而崩溃
+        assert result["status"] == "completed"
+        assert result["semantic_search_status"] == "keyword"
+
+        # 验证审计链完整性（即使 embedding 失败， audit log 也应可验证）
+        from shared.audit import verify_hash_chain
+        valid = await verify_hash_chain(test_db)
+        assert valid is True, "审计链应即使在 embedding 失败时也保持完整"

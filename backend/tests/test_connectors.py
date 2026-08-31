@@ -216,6 +216,31 @@ class TestConnectorConfig:
 # ============================================================
 # fetch_from_source 路由集成测试（mock httpx）
 # ============================================================
+
+class _FakeResult:
+    """模拟 SQLAlchemy Result —— scalar_one 返回 0（无重复证据），first 返回 None（空链）"""
+    def scalar_one(self):
+        return 0
+    def first(self):
+        return None
+
+class _FakeDB:
+    """最小 AsyncSession 假对象 —— 支持 fetch_from_source 的去重查询/flush"""
+    def __init__(self):
+        self.added = []
+    async def execute(self, *a, **kw):
+        return _FakeResult()
+    def add(self, obj):
+        self.added.append(obj)
+    async def flush(self):
+        return None
+
+class _FakeAuth:
+    email = "test@example.com"
+    ip_address = "127.0.0.1"
+    session_id = "test-session"
+
+
 class TestFetchFromSourceIntegration:
     """evidence_service fetch_from_source 路由分发到各 Connector"""
 
@@ -241,13 +266,14 @@ class TestFetchFromSourceIntegration:
                 request=MagicMock(),
                 source="BMS",
                 case_id="DEV-2025-08-147",
-                db=MagicMock(),
-                auth=MagicMock(email="test@example.com"),
+                db=_FakeDB(),
+                auth=_FakeAuth(),
             )
 
         assert result["status"] == "ok"
         assert result["source"] == "BMS"
         assert result["fetched_count"] == 1  # 来自 items 长度
+        assert result["persisted_count"] == 1  # 证据已去重落库
         # 验证调用 URL 包含 /bms/ahus
         call_args = mock_client.get.call_args
         url = call_args[0][0] if call_args[0] else call_args[1].get("url", "")
@@ -274,8 +300,8 @@ class TestFetchFromSourceIntegration:
             result = await fetch_from_source(
                 request=MagicMock(),
                 source="EMS",
-                db=MagicMock(),
-                auth=MagicMock(email="test@example.com"),
+                db=_FakeDB(),
+                auth=_FakeAuth(),
             )
 
         assert result["status"] == "ok"
@@ -305,8 +331,8 @@ class TestFetchFromSourceIntegration:
             result = await fetch_from_source(
                 request=MagicMock(),
                 source="MES",
-                db=MagicMock(),
-                auth=MagicMock(email="test@example.com"),
+                db=_FakeDB(),
+                auth=_FakeAuth(),
             )
 
         assert result["status"] == "ok"
@@ -324,8 +350,8 @@ class TestFetchFromSourceIntegration:
             await fetch_from_source(
                 request=MagicMock(),
                 source="UNKNOWN",
-                db=MagicMock(),
-                auth=MagicMock(email="test@example.com"),
+                db=_FakeDB(),
+                auth=_FakeAuth(),
             )
 
     async def test_unconfigured_connector_returns_skipped(self):
@@ -341,8 +367,8 @@ class TestFetchFromSourceIntegration:
             result = await fetch_from_source(
                 request=MagicMock(),
                 source="BMS",
-                db=MagicMock(),
-                auth=MagicMock(email="test@example.com"),
+                db=_FakeDB(),
+                auth=_FakeAuth(),
             )
 
         assert result["status"] == "skipped"
@@ -389,9 +415,10 @@ class TestFetchFromSourceIntegration:
             result = await fetch_from_source(
                 request=MagicMock(),
                 source="BMS",
-                db=MagicMock(),
-                auth=MagicMock(email="test@example.com"),
+                db=_FakeDB(),
+                auth=_FakeAuth(),
             )
 
-        # items 为空但 total=5，应取 total
-        assert result["fetched_count"] == 5
+        # 新实现：fetched_count 来自可落库的条目列表（items 为空 → 0 条）
+        # total 字段只是响应元信息，不作为落库依据（落库去重以实际条目为准）
+        assert result["fetched_count"] == 0

@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 import time
-from typing import Optional
 
 from fastapi import FastAPI, Request
 from prometheus_client import (
@@ -73,10 +72,11 @@ CASES_TOTAL = Gauge(
     labelnames=("status", "severity"),
     registry=REGISTRY,
 )
+# 注意：不用 case_id 作 label —— 无界高基数会拖垮 Prometheus（按 status 聚合即可）
 AGENT_RUNS_TOTAL = Counter(
     "rca_agent_runs_total",
     "Agent 流水线运行总数",
-    labelnames=("case_id", "status"),
+    labelnames=("status",),
     registry=REGISTRY,
 )
 AUDIT_LOGS_TOTAL = Gauge(
@@ -90,6 +90,33 @@ RATE_LIMITED_TOTAL = Counter(
     "rate_limited_total",
     "被限流的请求总数",
     labelnames=("service", "endpoint"),
+    registry=REGISTRY,
+)
+
+# 7. LLM / Agent 流水线业务指标（成本与性能可观测性）
+LLM_TOKENS_TOTAL = Counter(
+    "rca_llm_tokens_total",
+    "LLM token 用量累计",
+    labelnames=("agent", "model", "kind"),  # kind: prompt | completion
+    registry=REGISTRY,
+)
+LLM_CALLS_TOTAL = Counter(
+    "rca_llm_calls_total",
+    "LLM 调用次数",
+    labelnames=("agent", "model", "outcome"),  # outcome: success | error
+    registry=REGISTRY,
+)
+AGENT_STAGE_DURATION = Histogram(
+    "rca_agent_stage_duration_seconds",
+    "Agent 单阶段耗时（秒）",
+    labelnames=("agent", "mode"),  # mode: llm | rule
+    buckets=(0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0),
+    registry=REGISTRY,
+)
+HITL_DECISIONS_TOTAL = Counter(
+    "rca_hitl_decisions_total",
+    "HITL 人工决策次数",
+    labelnames=("gate", "action"),
     registry=REGISTRY,
 )
 
@@ -125,8 +152,9 @@ class MetricsMiddleware(BaseHTTPMiddleware):
         finally:
             duration = time.perf_counter() - start_time
             method = request.method
-            # 用路由 path 而非完整 URL（避免高基数）
-            endpoint = self._get_route_path(request) or path
+            # 用路由 path 而非完整 URL（避免高基数）；
+            # 未匹配路由（扫描器打任意 path）归一化为 "unmatched"，防止 label 爆炸
+            endpoint = self._get_route_path(request) or "unmatched"
 
             REQUEST_COUNT.labels(
                 service=self.service_name,
@@ -148,7 +176,7 @@ class MetricsMiddleware(BaseHTTPMiddleware):
                 ).inc()
 
     @staticmethod
-    def _get_route_path(request: Request) -> Optional[str]:
+    def _get_route_path(request: Request) -> str | None:
         """从 request.scope 提取路由模板（如 /cases/{case_id}）"""
         route = request.scope.get("route")
         if route and hasattr(route, "path"):
@@ -156,18 +184,22 @@ class MetricsMiddleware(BaseHTTPMiddleware):
         return None
 
 
-def register_metrics_endpoint(app: FastAPI) -> None:
-    """注册 /metrics 端点 —— Prometheus 抓取"""
+def register_metrics_endpoint(app: FastAPI, service_name: str = "") -> None:
+    """注册 /metrics 端点 —— Prometheus 抓取
+
+    service_name：与 MetricsMiddleware 一致的标签来源（不再用 app.title 造成同进程两套标签）
+    """
 
     @app.get("/metrics", tags=["meta"], include_in_schema=False)
     async def metrics():
         """Prometheus metrics 端点"""
         # 更新 DB 连接池指标
+        svc = service_name or app.title
         try:
             from shared.database import engine
             pool = engine.pool
-            DB_POOL_SIZE.labels(service=app.title).set(pool.size())
-            DB_POOL_CHECKED_OUT.labels(service=app.title).set(pool.checkedout())
+            DB_POOL_SIZE.labels(service=svc).set(pool.size())
+            DB_POOL_CHECKED_OUT.labels(service=svc).set(pool.checkedout())
         except Exception:
             pass
 

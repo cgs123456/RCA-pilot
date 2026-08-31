@@ -1,8 +1,9 @@
 """Alembic 迁移包 —— 通用工具函数"""
 from __future__ import annotations
 
-from alembic import op
 import sqlalchemy as sa
+
+from alembic import op
 
 
 def create_updated_at_trigger(table_name: str) -> None:

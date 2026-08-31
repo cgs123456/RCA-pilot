@@ -1,8 +1,8 @@
 """数据库会话管理 — 异步 SQLAlchemy"""
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
 
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -16,10 +16,12 @@ from .config import settings
 engine = create_async_engine(
     settings.postgres_dsn,
     echo=settings.debug,
-    pool_size=10,
-    max_overflow=20,
+    pool_size=5,
+    max_overflow=10,
     pool_pre_ping=True,
     pool_recycle=1800,
+    # 连接池监控：暴露池状态供 Prometheus 指标采集
+    _pool_name="rca-pilot-db",
 )
 
 AsyncSessionLocal = async_sessionmaker(
@@ -56,3 +58,17 @@ async def db_session() -> AsyncGenerator[AsyncSession, None]:
         except Exception:
             await session.rollback()
             raise
+
+
+# 连接池统计快照（供 Prometheus 采集）
+def pool_snapshot() -> dict[str, int | float | None]:
+    """获取连接池当前使用情况快照"""
+    if engine.pool is None:
+        return {"pool_size": 0, "checked_in": 0, "checked_out": 0, "overflow": 0}
+    pool = engine.pool
+    return {
+        "pool_size": pool.size(),
+        "checked_in": pool.checked_in(),
+        "checked_out": pool.checked_out(),
+        "overflow": pool.overflow() if hasattr(pool, "overflow") else None,
+    }

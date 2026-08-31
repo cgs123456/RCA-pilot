@@ -5,8 +5,8 @@ import os
 
 import uvicorn
 
-from shared.service_base import create_app
 from connectors.mes.routes import router
+from shared.service_base import create_app
 
 app = create_app("mes-connector", version="1.0.0")
 app.include_router(router, prefix="/api/v1")

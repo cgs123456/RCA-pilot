@@ -19,4 +19,10 @@ export const agentApi = {
 
   pause: (runId: string) =>
     api.post(`/agent/runs/${runId}/pause`).then((r) => r.data),
+
+  cancel: (runId: string) =>
+    api.post(`/agent/runs/${runId}/cancel`).then((r) => r.data),
+
+  resume: (runId: string) =>
+    api.post(`/agent/runs/${runId}/resume`).then((r) => r.data),
 };

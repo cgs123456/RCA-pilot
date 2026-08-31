@@ -1,9 +1,7 @@
 """统一配置管理 — 通过环境变量注入"""
 from __future__ import annotations
 
-import os
 from functools import lru_cache
-from typing import List
 
 from pydantic import Field, computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -37,6 +35,7 @@ class Settings(BaseSettings):
     redis_port: int = 6379
     redis_password: str = ""
     redis_db: int = 0
+    redis_enabled: bool = Field(default=True, description="False 时 jti 黑名单/限流共享存储直接降级（测试/离线环境）")
 
     # ---- JWT / 认证 ----
     jwt_secret: str = Field(
@@ -46,7 +45,16 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_access_ttl_minutes: int = 15
     jwt_refresh_ttl_days: int = 7
-    mfa_required: bool = True
+    # MFA：代码尚未实现 TOTP 校验（auth_service 登录流程不消费 mfa_code），
+    # 默认必须为 False，否则构成"声明与实现不符"的 GxP 审计发现。
+    # 实现 TOTP 后再改回 True。
+    mfa_required: bool = False
+    # 会话锁定：连续失败锁定时长（分钟），0 表示永久锁定（不推荐）
+    account_lockout_minutes: int = 15
+    # 服务间调用密钥（case→agent 内部触发、connector 鉴权）；prod 必填
+    service_api_key: str = Field(default="", description="服务间调用密钥，prod 必须配置")
+    # 可信代理：True 时才信任 X-Forwarded-For / X-Real-IP（部署在 Nginx 后且由 compose/网关固定时开启）
+    trust_proxy_headers: bool = Field(default=False, description="仅当部署在可信反代之后才开启")
 
     # ---- CORS ----
     cors_origins: str = "http://localhost:5173,http://localhost:3000,http://localhost:8080"
@@ -86,6 +94,7 @@ class Settings(BaseSettings):
     llm_model: str = "claude-sonnet-4-20250514"
     llm_base_url: str = ""  # 自定义 endpoint，留空则按 provider 选择默认值
     llm_max_tokens: int = 2048
+    llm_max_tokens_drafter: int = 4096  # Drafter 生成整篇 ICH Q9 报告需要更长输出
     llm_temperature: float = 0.2  # Reasoner 推理温度，偏低保证可复现性
     llm_timeout_seconds: int = 30  # HTTP 超时
     llm_max_retries: int = 2  # 失败重试次数（指数退避）
@@ -118,14 +127,33 @@ class Settings(BaseSettings):
 
     @computed_field
     @property
-    def cors_origins_list(self) -> List[str]:
+    def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+
+# 生产环境禁止的默认值 —— 忘记注入环境变量时 fail-fast，而不是带着公开密钥上线
+_INSECURE_DEFAULTS = {
+    "jwt_secret": "dev-secret-change-in-prod",
+    "postgres_password": "rca-secret",
+}
 
 
 @lru_cache
 def get_settings() -> Settings:
-    """单例配置"""
-    return Settings()
+    """单例配置 —— prod 环境对危险默认值做防呆校验"""
+    s = Settings()
+    if s.env == "prod":
+        problems = []
+        for field, insecure in _INSECURE_DEFAULTS.items():
+            if getattr(s, field) == insecure:
+                problems.append(
+                    f"{field} 仍为公开的默认值，禁止以 prod 环境启动（请注入环境变量 {field.upper()}）"
+                )
+        if not s.service_api_key:
+            problems.append("service_api_key 未配置（服务间调用与 connector 鉴权依赖它）")
+        if problems:
+            raise RuntimeError("生产配置校验失败：\n" + "\n".join(problems))
+    return s
 
 
 settings = get_settings()

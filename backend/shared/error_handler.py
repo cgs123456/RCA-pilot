@@ -16,7 +16,6 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.types import ASGIApp
 
 from .error_codes import ERROR_HTTP_STATUS, ErrorCode
 from .exceptions import (
@@ -35,6 +34,39 @@ trace_id_ctx: ContextVar[str] = ContextVar("trace_id", default="")
 def get_trace_id() -> str:
     """获取当前请求的 traceId（用于日志/审计）"""
     return trace_id_ctx.get()
+
+
+# 异常类 → ErrorCode 注册表 —— 新增异常子类在此登记，
+# 不再依赖 isinstance 链和字符串匹配
+_RCA_ERROR_CODE_MAP: dict[type, ErrorCode] = {}  # 延迟填充（见下方 _build_map）
+
+
+def _build_map() -> None:
+    from .exceptions import (
+        AgentHallucinationError,
+        AuditIntegrityError,
+        ConflictError,
+        ConnectorError,
+        SourceSystemReadOnlyError,
+    )
+
+    _RCA_ERROR_CODE_MAP.update(
+        {
+            AuthError: ErrorCode.UNAUTHORIZED,
+            ForbiddenError: ErrorCode.FORBIDDEN,
+            NotFoundError: ErrorCode.NOT_FOUND,
+            ValidationError: ErrorCode.BUSINESS_VALIDATION_ERROR,
+            HITLViolationError: ErrorCode.HITL_GATE_INVALID,
+            ConflictError: ErrorCode.CASE_STATUS_TRANSITION_INVALID,
+            AgentHallucinationError: ErrorCode.AI_HALLUCINATION_DETECTED,
+            AuditIntegrityError: ErrorCode.AUDIT_HASH_BROKEN,
+            ConnectorError: ErrorCode.CONNECTOR_UNREACHABLE,
+            SourceSystemReadOnlyError: ErrorCode.SOURCE_SYSTEM_READONLY,
+        }
+    )
+
+
+_build_map()
 
 
 class TraceIdMiddleware(BaseHTTPMiddleware):
@@ -75,42 +107,54 @@ def _error_response(
     )
 
 
+def _sanitize_validation_errors(errors: list) -> list:
+    """清洗 pydantic 校验错误 —— 剔除 input（可能含密码等敏感提交值）与 url"""
+    sanitized = []
+    for err in errors:
+        if isinstance(err, dict):
+            cleaned = {k: v for k, v in err.items() if k not in ("input", "url")}
+            sanitized.append(cleaned)
+        else:
+            sanitized.append(err)
+    return sanitized
+
+
 def register_exception_handlers(app: FastAPI) -> None:
     """注册全局异常处理器 —— 在 create_app 中调用"""
 
     @app.exception_handler(RCAError)
     async def rca_error_handler(request: Request, exc: RCAError):
-        """业务异常 —— 已知错误，按错误码返回"""
-        # 映射 RCAError 子类到 ErrorCode
-        if isinstance(exc, AuthError):
-            if "锁定" in str(exc):
-                code = ErrorCode.ACCOUNT_LOCKED
-            elif "禁用" in str(exc):
-                code = ErrorCode.ACCOUNT_DISABLED
-            elif "过期" in str(exc) or "超时" in str(exc):
-                code = ErrorCode.TOKEN_EXPIRED
+        """业务异常 —— 已知错误，按错误码返回
+
+        映射优先级：
+        1. 异常自带的结构化 error_code（AuthError 子场景显式设置，
+           替代旧的"中文字符串匹配"方案 —— 文案改动不再影响 API 错误码）
+        2. 异常类 → ErrorCode 注册表
+        """
+        # 1. 结构化 error_code（异常构造时显式指定）
+        exc_error_code = getattr(exc, "error_code", None)
+        if exc_error_code:
+            try:
+                code = ErrorCode(exc_error_code)
+            except ValueError:
+                code = None
             else:
-                code = ErrorCode.UNAUTHORIZED
-        elif isinstance(exc, ForbiddenError):
-            code = ErrorCode.FORBIDDEN
-        elif isinstance(exc, NotFoundError):
-            code = ErrorCode.NOT_FOUND
-        elif isinstance(exc, ValidationError):
-            code = ErrorCode.BUSINESS_VALIDATION_ERROR
-        elif isinstance(exc, HITLViolationError):
-            code = ErrorCode.HITL_GATE_INVALID
-        else:
+                return _error_response(code, str(exc), detail=getattr(exc, "details", None))
+
+        # 2. 类 → 错误码注册表
+        code = _RCA_ERROR_CODE_MAP.get(type(exc))
+        if code is None:
             code = ErrorCode.INTERNAL_ERROR
 
         return _error_response(code, str(exc), detail=getattr(exc, "details", None))
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(request: Request, exc: RequestValidationError):
-        """Pydantic 参数校验失败 —— 422"""
+        """Pydantic 参数校验失败 —— 422（响应不回显提交值，防止密码等泄露）"""
         return _error_response(
             ErrorCode.VALIDATION_ERROR,
             "请求参数校验失败",
-            detail=exc.errors(),
+            detail=_sanitize_validation_errors(exc.errors()),
         )
 
     @app.exception_handler(PermissionError)

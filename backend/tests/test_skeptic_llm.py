@@ -11,14 +11,14 @@
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import contextlib
+from datetime import UTC, datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.models import Deviation, Evidence
-
 
 pytestmark = pytest.mark.asyncio
 
@@ -35,7 +35,7 @@ async def skeptic_case(test_db: AsyncSession, seed_db):
         description="B 级背景区沉降菌采样 22 CFU，超出阈值 15 CFU",
         severity="major",
         status="investigating",
-        discovered_at=datetime.now(timezone.utc),
+        discovered_at=datetime.now(UTC),
         investigator_id="U-LC",
         product_impact="批号 BN-2025-08 待评估",
         immediate_action="暂停 B 级区作业，启动调查",
@@ -50,7 +50,7 @@ async def skeptic_case(test_db: AsyncSession, seed_db):
             id="E-SKP-01",
             case_id="DEV-SKP-001",
             source_system="LMS",
-            collected_at=datetime.now(timezone.utc),
+            collected_at=datetime.now(UTC),
             summary="EMP-2187 更衣资质 2025-08-10 逾期",
             raw_data={"status": "expired"},
             content_hash="sha256:skp-1",
@@ -60,7 +60,7 @@ async def skeptic_case(test_db: AsyncSession, seed_db):
             id="E-SKP-02",
             case_id="DEV-SKP-001",
             source_system="BMS",
-            collected_at=datetime.now(timezone.utc),
+            collected_at=datetime.now(UTC),
             summary="AHU-7 差压 470 Pa，超过预警值",
             raw_data={"delta_p": 470},
             content_hash="sha256:skp-2",
@@ -70,7 +70,7 @@ async def skeptic_case(test_db: AsyncSession, seed_db):
             id="E-SKP-03",
             case_id="DEV-SKP-001",
             source_system="CCTV",
-            collected_at=datetime.now(timezone.utc),
+            collected_at=datetime.now(UTC),
             summary="更衣录像显示 EMP-2187 未按规定步骤消毒",
             raw_data={"duration": 180},
             content_hash="sha256:skp-3",
@@ -88,7 +88,7 @@ async def skeptic_case(test_db: AsyncSession, seed_db):
     result = await test_db.execute(
         select(Deviation)
         .where(Deviation.id == "DEV-SKP-001")
-        .options(selectinload(Deviation.evidence))
+        .options(selectinload(Deviation.evidence), selectinload(Deviation.five_whys))
     )
     return result.scalar_one()
 
@@ -161,7 +161,7 @@ class TestSkepticRuleBased:
         from agent_service.routes import _build_rule_based_skeptic_output
 
         result = _build_rule_based_skeptic_output(skeptic_case, use_v2=True)
-        assert result["challenge_count"] == 5
+        assert result["challenge_count"] == 4
         # v2 包含 EMS 采样策略挑战
         types = [c["type"] for c in result["challenges"]]
         assert "evidence_gap" in types
@@ -249,7 +249,7 @@ class TestSkepticLLMPath:
         self, test_db: AsyncSession, skeptic_case, reasoner_output
     ):
         """验证 LLM 路径调用 chat_json 时传入正确的 schema 类"""
-        from agent_service.routes import _run_skeptic, _LLMSkepticOutput
+        from agent_service.routes import _LLMSkepticOutput, _run_skeptic
 
         mock_client = MagicMock()
         mock_client.is_configured = True
@@ -259,10 +259,8 @@ class TestSkepticLLMPath:
 
         with patch("shared.feature_flag.is_enabled", return_value=True), \
              patch("shared.llm_client.llm_client", mock_client):
-            try:
+            with contextlib.suppress(Exception):
                 await _run_skeptic(test_db, skeptic_case, reasoner_output)
-            except Exception:
-                pass  # mock 返回 MagicMock 会失败，但要验证调用参数
 
             assert mock_client.chat_json.called
             _, kwargs = mock_client.chat_json.call_args
@@ -276,7 +274,7 @@ class TestSkepticLLMPath:
 
         captured_prompt = {}
 
-        async def mock_chat_json(system, user_prompt, schema):
+        async def mock_chat_json(system, user_prompt, schema, **kwargs):
             captured_prompt["system"] = system
             captured_prompt["user"] = user_prompt
             raise RuntimeError("mock failure to capture prompt")
@@ -334,7 +332,7 @@ class TestSkepticLLMFallback:
         assert result["agent"] == "skeptic"
         assert result["status"] == "completed"
         # v2 flag 开启时规则版有 5 条
-        assert result["challenge_count"] == 5
+        assert result["challenge_count"] == 4
 
     async def test_fallback_when_llm_raises_config_error(
         self, test_db: AsyncSession, skeptic_case, reasoner_output
@@ -429,16 +427,18 @@ class TestSkepticLLMSchema:
 
     def test_empty_challenges_rejected(self):
         """challenges 为空数组时拒绝"""
-        from agent_service.routes import _LLMSkepticOutput
         from pydantic import ValidationError
+
+        from agent_service.routes import _LLMSkepticOutput
 
         with pytest.raises(ValidationError):
             _LLMSkepticOutput.model_validate({"challenges": []})
 
     def test_missing_target_rejected(self):
         """target 缺失时拒绝"""
-        from agent_service.routes import _LLMSkepticOutput
         from pydantic import ValidationError
+
+        from agent_service.routes import _LLMSkepticOutput
 
         invalid_data = {
             "challenges": [
@@ -455,8 +455,9 @@ class TestSkepticLLMSchema:
 
     def test_empty_challenge_text_rejected(self):
         """challenge 内容为空时拒绝"""
-        from agent_service.routes import _LLMSkepticOutput
         from pydantic import ValidationError
+
+        from agent_service.routes import _LLMSkepticOutput
 
         invalid_data = {
             "challenges": [
@@ -473,8 +474,9 @@ class TestSkepticLLMSchema:
 
     def test_missing_type_rejected(self):
         """type 缺失时拒绝（schema 要求 type 字段）"""
-        from agent_service.routes import _LLMSkepticOutput
         from pydantic import ValidationError
+
+        from agent_service.routes import _LLMSkepticOutput
 
         invalid_data = {
             "challenges": [

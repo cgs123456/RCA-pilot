@@ -10,8 +10,8 @@
 """
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator, Callable
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -60,13 +60,15 @@ def create_app(
             )
         yield
 
+    # prod 关闭 API 文档（减少攻击面），并收紧 CORS 方法/头
+    is_prod = settings.env == "prod"
     app = FastAPI(
         title=f"RCA Pilot — {service_name}",
         version=version,
         description="受 GxP 监管的 Agentic AI 偏差调查平台",
-        docs_url="/docs",
-        redoc_url="/redoc",
-        openapi_url=f"/{service_name}/openapi.json",
+        docs_url=None if is_prod else "/docs",
+        redoc_url=None if is_prod else "/redoc",
+        openapi_url=None if is_prod else f"/{service_name}/openapi.json",
         lifespan=lifespan or default_lifespan,
     )
 
@@ -78,8 +80,8 @@ def create_app(
         CORSMiddleware,
         allow_origins=settings.cors_origins_list,
         allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"] if is_prod else ["*"],
+        allow_headers=["Authorization", "Content-Type", "X-Trace-Id"] if is_prod else ["*"],
         expose_headers=["X-Trace-Id"],
     )
 
@@ -91,7 +93,7 @@ def create_app(
         from .metrics import MetricsMiddleware, register_metrics_endpoint
 
         app.add_middleware(MetricsMiddleware, service_name=service_name)
-        register_metrics_endpoint(app)
+        register_metrics_endpoint(app, service_name)
 
     # slowapi 限流
     if enable_rate_limit:
@@ -114,8 +116,10 @@ def create_app(
 
     @app.get("/ready", tags=["meta"])
     async def readiness():
-        """就绪检查 —— 检查 DB/Redis 连通性"""
+        """就绪检查 —— 检查 DB 连通性；未就绪返回 503（K8s readinessProbe 依赖状态码摘流）"""
+        from fastapi.responses import JSONResponse
         from sqlalchemy import text
+
         from .database import AsyncSessionLocal
 
         checks = {"service": service_name}
@@ -127,9 +131,10 @@ def create_app(
             checks["db"] = f"fail: {type(e).__name__}"
 
         all_ok = all(v == "ok" for k, v in checks.items() if k != "service")
-        return {
+        body = {
             "status": "ready" if all_ok else "not_ready",
             **checks,
         }
+        return JSONResponse(status_code=200 if all_ok else 503, content=body)
 
     return app

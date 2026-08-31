@@ -18,22 +18,22 @@ import {
 import type { KPI } from '@/types';
 
 export function DashboardPage() {
-  const { data: kpi, isLoading: kpiLoading } = useQuery<KPI>({
+  const { data: kpi, isLoading: kpiLoading, } = useQuery<KPI>({
     queryKey: ['kpi'],
     queryFn: caseApi.getKpi,
   });
 
-  const { data: casesData } = useQuery({
+  const { data: casesData, isLoading: casesLoading, isError: casesError, refetch: refetchCases } = useQuery({
     queryKey: ['cases', { page: 1, page_size: 5 }],
     queryFn: () => caseApi.list({ page: 1, page_size: 5 }),
   });
 
-  const { data: auditData } = useQuery({
+  const { data: auditData, isError: auditError } = useQuery({
     queryKey: ['audit-recent', { page: 1, page_size: 5 }],
     queryFn: () => auditApi.list({ page: 1, page_size: 5 }),
   });
 
-  const { data: sources } = useQuery({
+  const { data: sources, isError: sourcesError } = useQuery({
     queryKey: ['source-systems'],
     queryFn: caseApi.getSourceSystems,
   });
@@ -100,7 +100,9 @@ export function DashboardPage() {
           </CardHeader>
           <CardBody className="p-0">
             <div className="divide-y divide-ink-200">
-              {casesData?.items?.map((c) => (
+              {casesError ? (
+                <ErrorBanner message="案例列表加载失败" onRetry={() => refetchCases()} />
+              ) : casesData?.items?.map((c) => (
                 <Link
                   key={c.id}
                   to={`/investigation/${c.id}`}
@@ -138,7 +140,9 @@ export function DashboardPage() {
                   </div>
                 </Link>
               )) || (
-                <div className="px-5 py-8 text-center text-sm text-ink-500">加载中...</div>
+                <div className="px-5 py-8 text-center text-sm text-ink-500">
+                  {casesLoading ? '加载中...' : '暂无案例'}
+                </div>
               )}
             </div>
           </CardBody>
@@ -152,7 +156,9 @@ export function DashboardPage() {
           </CardHeader>
           <CardBody className="p-0">
             <div className="divide-y divide-ink-200">
-              {sources?.map((s) => (
+              {sourcesError ? (
+                <ErrorBanner message="源系统状态加载失败" />
+              ) : sources?.map((s) => (
                 <div key={s.code} className="px-5 py-3 flex items-center justify-between">
                   <div className="flex items-center gap-2">
                     <span className={`text-xs px-1.5 py-0.5 rounded ${sourceBadgeClass(s.code)}`}>
@@ -171,7 +177,9 @@ export function DashboardPage() {
                   </div>
                 </div>
               )) || (
-                <div className="px-5 py-8 text-center text-sm text-ink-500">加载中...</div>
+                <div className="px-5 py-8 text-center text-sm text-ink-500">
+                  {sources === undefined ? '加载中...' : '暂无源系统'}
+                </div>
               )}
             </div>
           </CardBody>
@@ -188,7 +196,9 @@ export function DashboardPage() {
         </CardHeader>
         <CardBody className="p-0">
           <div className="divide-y divide-ink-200">
-            {auditData?.items?.map((log) => (
+            {auditError ? (
+              <ErrorBanner message="审计日志加载失败" />
+            ) : auditData?.items?.map((log) => (
               <div key={log.log_id} className="px-5 py-3 flex items-center gap-3">
                 <span className="text-xs font-mono text-ink-400 w-12">#{log.seq}</span>
                 <Badge variant="default">{log.action}</Badge>
@@ -215,13 +225,26 @@ export function DashboardPage() {
   );
 }
 
+function ErrorBanner({ message, onRetry }: { message: string; onRetry?: () => void }) {
+  return (
+    <div className="px-5 py-8 text-center">
+      <div className="text-sm text-danger-600 mb-2">{message}</div>
+      {onRetry && (
+        <button onClick={onRetry} className="text-xs text-brand-600 hover:underline">
+          重试
+        </button>
+      )}
+    </div>
+  );
+}
+
 function KpiCard({
   title, value, trend, icon: Icon, color, loading, invertTrend,
 }: {
   title: string;
   value: string | number;
   trend?: number;
-  icon: any;
+  icon: React.ComponentType<{ className?: string }>;
   color: 'brand' | 'success' | 'warning' | 'danger';
   loading?: boolean;
   invertTrend?: boolean;

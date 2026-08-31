@@ -12,14 +12,13 @@
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.models import Deviation, Evidence
-
 
 pytestmark = pytest.mark.asyncio
 
@@ -36,7 +35,7 @@ async def drafter_case(test_db: AsyncSession, seed_db):
         description="B 级背景区沉降菌采样 22 CFU，超出阈值 15 CFU",
         severity="major",
         status="investigating",
-        discovered_at=datetime.now(timezone.utc),
+        discovered_at=datetime.now(UTC),
         investigator_id="U-LC",
         product_impact="批号 BN-2025-08 待评估",
         immediate_action="暂停 B 级区作业，启动调查",
@@ -51,7 +50,7 @@ async def drafter_case(test_db: AsyncSession, seed_db):
             id="E-DRF-01",
             case_id="DEV-DRF-001",
             source_system="LMS",
-            collected_at=datetime.now(timezone.utc),
+            collected_at=datetime.now(UTC),
             summary="EMP-2187 更衣资质 2025-08-10 逾期",
             raw_data={},
             content_hash="sha256:drf-1",
@@ -61,7 +60,7 @@ async def drafter_case(test_db: AsyncSession, seed_db):
             id="E-DRF-02",
             case_id="DEV-DRF-001",
             source_system="BMS",
-            collected_at=datetime.now(timezone.utc),
+            collected_at=datetime.now(UTC),
             summary="AHU-7 差压 470 Pa 超过预警值",
             raw_data={},
             content_hash="sha256:drf-2",
@@ -79,7 +78,7 @@ async def drafter_case(test_db: AsyncSession, seed_db):
     result = await test_db.execute(
         select(Deviation)
         .where(Deviation.id == "DEV-DRF-001")
-        .options(selectinload(Deviation.evidence))
+        .options(selectinload(Deviation.evidence), selectinload(Deviation.five_whys))
     )
     return result.scalar_one()
 
@@ -275,7 +274,7 @@ LMS 与排班系统未集成导致资质逾期仍能进入 B 级区。
 
         captured_prompt = {}
 
-        async def mock_chat(system, user_prompt, json_mode=False):
+        async def mock_chat(system, user_prompt, json_mode=False, **kwargs):
             captured_prompt["system"] = system
             captured_prompt["user"] = user_prompt
             return "# Mock report"
@@ -288,7 +287,7 @@ LMS 与排班系统未集成导致资质逾期仍能进入 B 级区。
 
         with patch("shared.feature_flag.is_enabled", return_value=True), \
              patch("shared.llm_client.llm_client", mock_client):
-            result = await _run_drafter(test_db, drafter_case, reasoner_output, skeptic_output)
+            await _run_drafter(test_db, drafter_case, reasoner_output, skeptic_output)
 
         # user prompt 应包含案例 + 证据 + Reasoner + Skeptic 信息
         user = captured_prompt["user"]

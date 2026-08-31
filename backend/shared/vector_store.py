@@ -1,10 +1,13 @@
-"""向量检索 — 基于 numpy 的余弦相似度
+"""向量检索 — 纯 Python 余弦相似度（不依赖 numpy/Chroma/faiss/sqlite-vec）
 
 设计目标：
-1. **零额外依赖**：用 numpy 做向量运算，不引入 Chroma/faiss/sqlite-vec
-2. **内存缓存 + DB 持久化**：embedding 存在 Evidence 表 JSONB 列，查询时加载到内存
-3. **降级友好**：LLM 未配置时降级到关键词 LIKE 搜索（fallback_search）
+1. **零额外依赖**：纯 Python 实现余弦相似度，带候选数上限
+2. **DB 持久化**：embedding 存在 Evidence 表 JSONB 列
+3. **降级友好**：LLM 未配置时降级到关键词 Jaccard 搜索
 4. **跨案例关联**：支持搜索非当前案例的证据，用于 related_historical_cases
+
+规模提示：候选上限 2000 条适用于中小规模；证据量增长到万级以上时应迁移
+pgvector（HNSW 索引）做 ANN 检索。
 
 用法：
     from shared.vector_store import vector_search, keyword_search, search_evidence
@@ -14,14 +17,13 @@
 
     # 跨案例关联（排除当前案例）
     related = await search_evidence(
-        db, query="EMP-2187 资质逾期", top_k=5, exclude_case_id="DEV-001"
+        db, query="资质逾期", top_k=5, exclude_case_id="DEV-001"
     )
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -36,7 +38,7 @@ from .models import Evidence
 class SearchResult:
     """语义搜索结果项"""
     evidence_id: str
-    case_id: Optional[str]
+    case_id: str | None
     source_system: str
     summary: str
     score: float  # 0.0-1.0，余弦相似度或关键词匹配率
@@ -46,7 +48,7 @@ class SearchResult:
 # ============================================================
 # 向量检索核心
 # ============================================================
-def _cosine_similarity(a: List[float], b: List[float]) -> float:
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
     """计算两个向量的余弦相似度（不依赖 numpy，避免依赖膨胀）
 
     Returns:
@@ -54,7 +56,7 @@ def _cosine_similarity(a: List[float], b: List[float]) -> float:
     """
     if not a or not b or len(a) != len(b):
         return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
+    dot = sum(x * y for x, y in zip(a, b, strict=False))
     norm_a = math.sqrt(sum(x * x for x in a))
     norm_b = math.sqrt(sum(y * y for y in b))
     if norm_a == 0 or norm_b == 0:
@@ -64,10 +66,11 @@ def _cosine_similarity(a: List[float], b: List[float]) -> float:
 
 async def vector_search(
     db: AsyncSession,
-    query_embedding: List[float],
+    query_embedding: list[float],
     top_k: int = 10,
-    exclude_case_id: Optional[str] = None,
-) -> List[SearchResult]:
+    exclude_case_id: str | None = None,
+    max_candidates: int = 2000,
+) -> list[SearchResult]:
     """向量语义搜索
 
     Args:
@@ -75,12 +78,19 @@ async def vector_search(
         query_embedding: 查询向量
         top_k: 返回前 K 条
         exclude_case_id: 排除该案例的证据（用于跨案例关联时排除自身）
+        max_candidates: 参与相似度计算的最大候选数（防止全表加载；
+            证据量超过此值时应迁移 pgvector + HNSW 索引）
 
     Returns:
         List[SearchResult]: 按相似度降序排列的结果
     """
-    # 加载所有已嵌入的证据（embedding 非空）
-    stmt = select(Evidence).where(Evidence.embedding.isnot(None))
+    # 候选上限 + 确定性排序（新证据优先参与计算），避免每次搜索全表 IO + O(N·D) CPU
+    stmt = (
+        select(Evidence)
+        .where(Evidence.embedding.isnot(None))
+        .order_by(Evidence.created_at.desc())
+        .limit(max_candidates)
+    )
     if exclude_case_id:
         stmt = stmt.where(Evidence.case_id != exclude_case_id)
     result = await db.execute(stmt)
@@ -89,10 +99,12 @@ async def vector_search(
     if not evidences:
         return []
 
-    # 计算相似度
+    dim = len(query_embedding)
+    # 计算相似度（维度不匹配的向量直接跳过 —— 不同 embedding model 的向量混存时
+    # 余弦值无意义，旧实现返回 0 分会污染排序）
     scored = []
     for ev in evidences:
-        if not ev.embedding:
+        if not ev.embedding or len(ev.embedding) != dim:
             continue
         score = _cosine_similarity(query_embedding, ev.embedding)
         scored.append(SearchResult(
@@ -116,8 +128,8 @@ async def keyword_search(
     db: AsyncSession,
     query: str,
     top_k: int = 10,
-    exclude_case_id: Optional[str] = None,
-) -> List[SearchResult]:
+    exclude_case_id: str | None = None,
+) -> list[SearchResult]:
     """关键词 LIKE 搜索 — LLM 未配置时的降级路径
 
     使用简单的 Jaccard 相似度：query 词集与 summary 词集的交集占比
@@ -125,7 +137,12 @@ async def keyword_search(
     if not query.strip():
         return []
 
-    stmt = select(Evidence)
+    # 候选上限 + 确定性排序，避免全表加载（与 vector_search 同策略）
+    stmt = (
+        select(Evidence)
+        .order_by(Evidence.created_at.desc())
+        .limit(2000)
+    )
     if exclude_case_id:
         stmt = stmt.where(Evidence.case_id != exclude_case_id)
     result = await db.execute(stmt)
@@ -180,9 +197,9 @@ async def search_evidence(
     db: AsyncSession,
     query: str,
     top_k: int = 10,
-    exclude_case_id: Optional[str] = None,
-    query_embedding: Optional[List[float]] = None,
-) -> List[SearchResult]:
+    exclude_case_id: str | None = None,
+    query_embedding: list[float] | None = None,
+) -> list[SearchResult]:
     """证据搜索 — 优先语义搜索，降级到关键词搜索
 
     Args:
@@ -210,9 +227,9 @@ async def find_related_cases(
     db: AsyncSession,
     query: str,
     top_k: int = 5,
-    exclude_case_id: Optional[str] = None,
-    query_embedding: Optional[List[float]] = None,
-) -> List[dict]:
+    exclude_case_id: str | None = None,
+    query_embedding: list[float] | None = None,
+) -> list[dict]:
     """跨案例关联 — 找出与当前案例相关的历史案例
 
     Args:

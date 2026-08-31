@@ -4,8 +4,8 @@ from __future__ import annotations
 import json
 import logging
 import sys
-from datetime import datetime, timezone
-from typing import Any, Dict
+from datetime import UTC, datetime
+from typing import Any
 
 from .config import settings
 
@@ -14,8 +14,8 @@ class JSONFormatter(logging.Formatter):
     """JSON 日志格式器 — GxP 要求日志可机器解析"""
 
     def format(self, record: logging.LogRecord) -> str:
-        log_entry: Dict[str, Any] = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+        log_entry: dict[str, Any] = {
+            "timestamp": datetime.now(UTC).isoformat(),
             "level": record.levelname,
             "service": settings.service_name,
             "env": settings.env,
@@ -27,6 +27,15 @@ class JSONFormatter(logging.Formatter):
         }
         if record.exc_info:
             log_entry["exception"] = self.formatException(record.exc_info)
+        # traceId 贯穿：与错误响应/审计日志可互相关联
+        try:
+            from .error_handler import get_trace_id
+
+            trace = get_trace_id()
+            if trace:
+                log_entry["trace_id"] = trace
+        except Exception:
+            pass
         # 自定义字段
         for key, value in getattr(record, "extra_fields", {}).items():
             log_entry[key] = value

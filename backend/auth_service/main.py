@@ -5,8 +5,8 @@ import os
 
 import uvicorn
 
-from shared.service_base import create_app
 from auth_service.routes import router
+from shared.service_base import create_app
 
 app = create_app("auth-service")
 app.include_router(router, prefix="/api/v1")

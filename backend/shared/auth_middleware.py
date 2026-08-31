@@ -2,14 +2,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from datetime import UTC
 
 from fastapi import Depends, Header, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .database import get_db
-from .exceptions import AuthError, ForbiddenError
+from .exceptions import AuthError
 from .models import User
 from .security import decode_token, require_permission
 
@@ -44,9 +44,29 @@ class AuthContext:
         require_permission(self.role, permission)
 
 
+def get_client_ip(request: Request) -> str:
+    """统一获取客户端 IP
+
+    仅当 settings.trust_proxy_headers=True（部署在可信反代之后）才解析
+    X-Forwarded-For / X-Real-IP；否则一律取直连地址 —— 防止伪造 XFF 绕过限流、
+    伪造审计 IP。
+    """
+    from .config import settings
+
+    if settings.trust_proxy_headers:
+        # 反代追加模式：XFF 最右侧是最近一跳可信代理写入的客户端地址
+        xff = request.headers.get("X-Forwarded-For")
+        if xff:
+            return xff.split(",")[-1].strip()
+        xri = request.headers.get("X-Real-IP")
+        if xri:
+            return xri
+    return request.client.host if request.client else "unknown"
+
+
 async def get_auth_context(
     request: Request,
-    authorization: Optional[str] = Header(default=None),
+    authorization: str | None = Header(default=None),
     db: AsyncSession = Depends(get_db),
 ) -> AuthContext:
     """从 Authorization Bearer token 解析用户
@@ -54,10 +74,21 @@ async def get_auth_context(
     此依赖会创建 DB Session 并在请求结束时统一 commit/rollback。
     后续端点应通过 get_db_from_auth 复用同一 session，避免重复获取连接。
     """
+    from datetime import datetime, timedelta
+
+    from .config import settings
+    from .error_codes import ErrorCode
+    from .security import ROLE_PERMISSIONS, is_jti_revoked
+
     if not authorization or not authorization.startswith("Bearer "):
         raise AuthError("缺少 Authorization 头")
     token = authorization.removeprefix("Bearer ").strip()
     payload = decode_token(token, expected_type="access")
+
+    # 吊销检查 —— 登出/管理员禁用后 access token 立即失效（Redis 黑名单，不可用时降级放行）
+    jti = payload.get("jti", "")
+    if jti and await is_jti_revoked(jti):
+        raise AuthError("会话已注销，请重新登录", error_code=ErrorCode.TOKEN_INVALID.value)
 
     user_id = payload.get("sub")
     if not user_id:
@@ -66,24 +97,21 @@ async def get_auth_context(
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
     if not user or not user.is_active:
-        raise AuthError("用户不存在或已禁用")
+        raise AuthError("用户不存在或已禁用", error_code=ErrorCode.ACCOUNT_DISABLED.value)
 
     # 会话超时检查
-    from .config import settings
-    from datetime import datetime, timezone, timedelta
     iat = payload.get("iat")
     if iat:
-        issued = datetime.fromtimestamp(iat, tz=timezone.utc)
-        if datetime.now(timezone.utc) - issued > timedelta(minutes=settings.session_timeout_minutes):
-            raise AuthError("会话超时，请重新登录")
+        issued = datetime.fromtimestamp(int(iat), tz=UTC)
+        if datetime.now(UTC) - issued > timedelta(minutes=settings.session_timeout_minutes):
+            raise AuthError("会话超时，请重新登录", error_code=ErrorCode.TOKEN_EXPIRED.value)
 
-    from .security import ROLE_PERMISSIONS
     permissions = ROLE_PERMISSIONS.get(user.role, set())
 
     return AuthContext(
         user=user,
-        session_id=payload.get("jti", ""),
-        ip_address=request.client.host if request.client else "unknown",
+        session_id=jti,
+        ip_address=get_client_ip(request),
         permissions=permissions,
         db=db,
     )

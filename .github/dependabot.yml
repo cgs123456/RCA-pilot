@@ -10,7 +10,6 @@ updates:
       day: "monday"
     open-pull-requests-limit: 5
     labels: ["dependencies", "python"]
-    reviewers: ["your-team/maintainers"]
 
   # 前端 npm 依赖（每周一检查）
   - package-ecosystem: "npm"
@@ -20,7 +19,6 @@ updates:
       day: "monday"
     open-pull-requests-limit: 5
     labels: ["dependencies", "frontend"]
-    reviewers: ["your-team/maintainers"]
 
   # Docker 镜像基础镜像更新（每月检查）
   - package-ecosystem: "docker"

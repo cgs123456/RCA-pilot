@@ -9,8 +9,8 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from collections.abc import AsyncGenerator
 from pathlib import Path
-from typing import AsyncGenerator
 
 # 把 backend/ 加入 sys.path，让 from shared.xxx 可解析
 BACKEND_DIR = Path(__file__).parent.parent
@@ -27,13 +27,11 @@ os.environ.setdefault("POSTGRES_PORT", "5432")
 os.environ.setdefault("POSTGRES_USER", "test")
 os.environ.setdefault("POSTGRES_PASSWORD", "test")
 os.environ.setdefault("POSTGRES_DB", "test_db")
+# 测试环境无 Redis —— 直接降级（jti 黑名单/限流共享存储不可用是预期行为）
+os.environ.setdefault("REDIS_ENABLED", "false")
 
 import pytest
 import pytest_asyncio
-from httpx import ASGITransport, AsyncClient
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy import JSON, select
-from sqlalchemy.pool import StaticPool
 
 # ============================================================
 # SQLite 测试兼容 —— patch PostgreSQL 专属类型
@@ -41,6 +39,11 @@ from sqlalchemy.pool import StaticPool
 # 在导入 shared.models 之前，patch JSONB→JSON, ARRAY→String
 # 这样 SQLite 能创建表结构（牺牲 PG 专属特性，但应用层逻辑不变）
 import sqlalchemy.dialects.postgresql as pg_dialect
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy import JSON, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import StaticPool
+
 
 class _JSONBCompat(JSON):
     """JSONB 兼容 SQLite —— 退化为 JSON（SQLite 用 TEXT 存储）"""
@@ -57,15 +60,17 @@ pg_dialect.ARRAY = _ARRAYCompat
 
 # 同时 patch sqlalchemy.dialects.postgresql 模块中的引用
 import sqlalchemy as _sa
+
 _sa.dialects.postgresql.JSONB = _JSONBCompat
 _sa.dialects.postgresql.ARRAY = _ARRAYCompat
 
 from shared.database import Base, get_db
 from shared.models import User
-from shared.security import hash_password
 
 # 测试模式下禁用限流 —— 避免 10/min 登录上限卡住批量测试
 from shared.rate_limit import limiter as _global_limiter
+from shared.security import hash_password
+
 _global_limiter.enabled = False
 
 
@@ -150,8 +155,8 @@ async def seed_db(test_db: AsyncSession):
 @pytest_asyncio.fixture(scope="function")
 async def app_client(test_engine, seed_db):
     """创建带测试 DB 注入的 FastAPI 测试客户端（auth_service）"""
-    from shared.service_base import create_app
     from auth_service.routes import router as auth_router
+    from shared.service_base import create_app
 
     app = create_app("auth-service", enable_metrics=False)
     app.include_router(auth_router, prefix="/api/v1")
@@ -182,8 +187,8 @@ async def app_client(test_engine, seed_db):
 @pytest_asyncio.fixture(scope="function")
 async def case_app_client(test_engine, seed_db):
     """case_service 测试客户端 —— 复用 auth token 验证"""
-    from shared.service_base import create_app
     from case_service.routes import router as case_router
+    from shared.service_base import create_app
 
     app = create_app("case-service", enable_metrics=False)
     app.include_router(case_router, prefix="/api/v1")
@@ -202,7 +207,7 @@ async def case_app_client(test_engine, seed_db):
                 raise
 
     # 同时覆盖 get_db 和 get_db_from_auth（后者依赖 AuthContext）
-    from shared.auth_middleware import get_db_from_auth, get_auth_context
+    from shared.auth_middleware import get_auth_context, get_db_from_auth
 
     async def override_auth_context(
         authorization=None, request=None, db=None

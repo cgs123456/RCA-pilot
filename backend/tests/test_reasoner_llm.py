@@ -13,7 +13,8 @@
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import contextlib
+from datetime import UTC, datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -21,7 +22,6 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.models import Deviation, Evidence
-
 
 pytestmark = pytest.mark.asyncio
 
@@ -38,7 +38,7 @@ async def llm_case(test_db: AsyncSession, seed_db):
         description="B 级背景区沉降菌采样 22 CFU，超出阈值 15 CFU",
         severity="major",
         status="investigating",
-        discovered_at=datetime.now(timezone.utc),
+        discovered_at=datetime.now(UTC),
         investigator_id="U-LC",
         product_impact="批号 BN-2025-08 待评估",
         immediate_action="暂停 B 级区作业，启动调查",
@@ -53,7 +53,7 @@ async def llm_case(test_db: AsyncSession, seed_db):
             id="E-LLM-01",
             case_id="DEV-LLM-001",
             source_system="LIMS",
-            collected_at=datetime.now(timezone.utc),
+            collected_at=datetime.now(UTC),
             summary="B 级区沉降菌 22 CFU/4h，阈值 15 CFU",
             raw_data={"cfu": 22, "threshold": 15},
             content_hash="sha256:llm-test-1",
@@ -63,7 +63,7 @@ async def llm_case(test_db: AsyncSession, seed_db):
             id="E-LLM-02",
             case_id="DEV-LLM-001",
             source_system="LMS",
-            collected_at=datetime.now(timezone.utc),
+            collected_at=datetime.now(UTC),
             summary="EMP-2187 更衣资质 2025-08-10 逾期",
             raw_data={"status": "expired", "expired_at": "2025-08-10"},
             content_hash="sha256:llm-test-2",
@@ -73,7 +73,7 @@ async def llm_case(test_db: AsyncSession, seed_db):
             id="E-LLM-03",
             case_id="DEV-LLM-001",
             source_system="BMS",
-            collected_at=datetime.now(timezone.utc),
+            collected_at=datetime.now(UTC),
             summary="AHU-7 差压 470 Pa，超过预警值 400 Pa",
             raw_data={"delta_p": 470, "warning_threshold": 400},
             content_hash="sha256:llm-test-3",
@@ -94,6 +94,7 @@ async def llm_case(test_db: AsyncSession, seed_db):
         .options(
             selectinload(Deviation.evidence),
             selectinload(Deviation.timeline),
+            selectinload(Deviation.five_whys),
         )
     )
     return result.scalar_one()
@@ -357,7 +358,7 @@ class TestReasonerLLMPath:
              patch("shared.llm_client.llm_client", mock_client), \
              patch("agent_service.routes._LLMReasonerOutput") as mock_schema:
             # 让 schema.model_validate 直接返回带原始字段的 mock 对象
-            mock_schema.return_value = mockSchema = MagicMock()
+            mock_schema.return_value = MagicMock()
             # 用真实的 Pydantic 校验逻辑
             from agent_service.routes import _LLMReasonerOutput
             validated = _LLMReasonerOutput.model_validate(mock_llm_output)
@@ -390,7 +391,7 @@ class TestReasonerLLMPath:
         self, test_db: AsyncSession, llm_case, eh_output
     ):
         """验证 LLM 路径调用 chat_json 时传入正确的 schema 类"""
-        from agent_service.routes import _run_reasoner, _LLMReasonerOutput
+        from agent_service.routes import _LLMReasonerOutput, _run_reasoner
 
         mock_client = MagicMock()
         mock_client.is_configured = True
@@ -400,10 +401,8 @@ class TestReasonerLLMPath:
 
         with patch("shared.feature_flag.is_enabled", return_value=True), \
              patch("shared.llm_client.llm_client", mock_client):
-            try:
+            with contextlib.suppress(Exception):
                 await _run_reasoner(test_db, llm_case, eh_output)
-            except Exception:
-                pass  # mock 返回 MagicMock 会失败，但我们要验证调用参数
 
             # 验证 chat_json 被调用，且第三个参数是 _LLMReasonerOutput 类
             assert mock_client.chat_json.called
@@ -425,7 +424,7 @@ class TestReasonerLLMPath:
         # 让 chat_json 直接抛异常，从而能检查传入的 user_prompt
         captured_prompt = {}
 
-        async def mock_chat_json(system, user_prompt, schema):
+        async def mock_chat_json(system, user_prompt, schema, **kwargs):
             captured_prompt["system"] = system
             captured_prompt["user"] = user_prompt
             raise RuntimeError("mock failure to capture prompt")
@@ -581,8 +580,9 @@ class TestLLMReasonerSchema:
 
     def test_invalid_fishbone_categories_count_rejected(self):
         """鱼骨图分类数 ≠ 6 时拒绝"""
-        from agent_service.routes import _LLMReasonerOutput
         from pydantic import ValidationError
+
+        from agent_service.routes import _LLMReasonerOutput
 
         invalid_data = {
             "five_whys": [{"n": 1, "question": "q", "answer": "a", "evidence_ids": ["E-01"]}],
@@ -603,8 +603,9 @@ class TestLLMReasonerSchema:
 
     def test_empty_five_whys_rejected(self):
         """five_whys 为空数组时拒绝"""
-        from agent_service.routes import _LLMReasonerOutput
         from pydantic import ValidationError
+
+        from agent_service.routes import _LLMReasonerOutput
 
         invalid_data = {
             "five_whys": [],  # 空
@@ -626,8 +627,9 @@ class TestLLMReasonerSchema:
 
     def test_missing_root_cause_summary_rejected(self):
         """root_cause_summary 缺失时拒绝"""
-        from agent_service.routes import _LLMReasonerOutput
         from pydantic import ValidationError
+
+        from agent_service.routes import _LLMReasonerOutput
 
         invalid_data = {
             "five_whys": [{"n": 1, "question": "q", "answer": "a", "evidence_ids": ["E-01"]}],
@@ -844,8 +846,9 @@ class TestLLMClientChatJSON:
 
     async def test_chat_json_valid_schema(self):
         """chat_json 成功路径 — 返回 Pydantic 实例"""
-        from shared.llm_client import LLMClient
         from pydantic import BaseModel as PydBaseModel
+
+        from shared.llm_client import LLMClient
 
         class TestSchema(PydBaseModel):
             answer: str
@@ -872,8 +875,9 @@ class TestLLMClientChatJSON:
 
     async def test_chat_json_invalid_json_raises(self):
         """chat_json 收到非 JSON 抛 LLMResponseError"""
-        from shared.llm_client import LLMClient, LLMResponseError
         from pydantic import BaseModel as PydBaseModel
+
+        from shared.llm_client import LLMClient, LLMResponseError
 
         class TestSchema(PydBaseModel):
             answer: str
@@ -895,8 +899,9 @@ class TestLLMClientChatJSON:
 
     async def test_chat_json_schema_validation_fails(self):
         """chat_json schema 校验失败抛 LLMResponseError"""
-        from shared.llm_client import LLMClient, LLMResponseError
         from pydantic import BaseModel as PydBaseModel
+
+        from shared.llm_client import LLMClient, LLMResponseError
 
         class TestSchema(PydBaseModel):
             answer: str

@@ -3,7 +3,7 @@
  * 管理 access/refresh token、当前用户、登录/登出
  */
 import { create } from 'zustand';
-import { persist } from 'zustand/middleware';
+import { persist, createJSONStorage } from 'zustand/middleware';
 import api from '@/services/api-client';
 import type { TokenResponse, User } from '@/types';
 
@@ -68,9 +68,9 @@ export const useAuthStore = create<AuthState>()(
     }),
     {
       name: 'rca-auth',
+      storage: createJSONStorage(() => sessionStorage), // 关闭标签页即清除（localStorage 会被 XSS 长期窃取）
+      // 仅持久化用户信息；token 只存内存（httpOnly Cookie 是生产形态，见 README 安全说明）
       partialize: (state) => ({
-        accessToken: state.accessToken,
-        refreshToken: state.refreshToken,
         user: state.user,
         isAuthenticated: state.isAuthenticated,
       }),

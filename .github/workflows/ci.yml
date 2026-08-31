@@ -1,7 +1,7 @@
 # ============================================================
 # RCA Pilot — 持续集成流水线（CI）
 # 触发：push 到 main/develop，或 PR 到 main
-# 作用：代码质量门禁（lint / type-check / 测试覆盖率 / DB 迁移一致性）
+# 作用：代码质量门禁（lint / type-check / 测试覆盖率 / 安全扫描 / DB 迁移一致性）
 # ============================================================
 name: CI
 
@@ -64,13 +64,46 @@ jobs:
           DATABASE_URL: sqlite:///:memory:
           ENV: test
           JWT_SECRET: ci-test-secret
+          REDIS_ENABLED: "false"
 
   # ============================================================
-  # Job 2: 前端类型检查 + 构建
+  # Job 2: 依赖与代码安全扫描（GxP 供应链要求）
+  # pip-audit 依赖 CVE + Trivy 文件系统/配置扫描
+  # ============================================================
+  security-scan:
+    name: Security Scan (pip-audit + Trivy)
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: pip-audit 依赖 CVE 扫描（后端）
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          # 以 requirements 为准扫描已知 CVE；发现高危即失败
+          pip-audit -r backend/requirements.txt --strict
+
+      - name: Trivy 文件系统扫描（含配置与 secrets）
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+
+  # ============================================================
+  # Job 3: 前端类型检查 + Lint + 构建
   # 与 lint-and-test 并行运行
   # ============================================================
   typecheck-and-build:
-    name: Frontend Typecheck & Build
+    name: Frontend Lint & Typecheck & Build
     runs-on: ubuntu-22.04
     defaults:
       run:
@@ -90,6 +123,9 @@ jobs:
       - name: 安装前端依赖
         run: npm ci --legacy-peer-deps
 
+      - name: ESLint 检查
+        run: npm run lint
+
       - name: TypeScript 类型检查
         run: npx tsc --noEmit
 
@@ -104,9 +140,8 @@ jobs:
           retention-days: 7
 
   # ============================================================
-  # Job 3: Alembic 迁移一致性检查
-  # 依赖 lint-and-test 完成后串行执行
-  # 启动 postgres:15-alpine service container 跑真实迁移
+  # Job 4: Alembic 迁移一致性检查（真实 PostgreSQL）
+  # 升级到 head → 检查模型一致 → downgrade 往返验证 → 再升级
   # ============================================================
   alembic-check:
     name: Alembic Migration Check
@@ -133,6 +168,14 @@ jobs:
       run:
         working-directory: backend
 
+    env:
+      PYTHONPATH: backend
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: rca
+      POSTGRES_PASSWORD: rca-secret
+      POSTGRES_DB: rca_pilot
+
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -152,20 +195,12 @@ jobs:
 
       - name: 应用迁移到 head
         run: alembic upgrade head
-        env:
-          PYTHONPATH: backend
-          POSTGRES_HOST: localhost
-          POSTGRES_PORT: 5432
-          POSTGRES_USER: rca
-          POSTGRES_PASSWORD: rca-secret
-          POSTGRES_DB: rca_pilot
 
       - name: 检查模型与迁移是否一致
         run: alembic check
-        env:
-          PYTHONPATH: backend
-          POSTGRES_HOST: localhost
-          POSTGRES_PORT: 5432
-          POSTGRES_USER: rca
-          POSTGRES_PASSWORD: rca-secret
-          POSTGRES_DB: rca_pilot
+
+      # GxP 系统生命周期内必然多次升级 —— 迁移必须可回滚
+      - name: 降级往返验证（downgrade base → 重新 upgrade head）
+        run: |
+          alembic downgrade base
+          alembic upgrade head

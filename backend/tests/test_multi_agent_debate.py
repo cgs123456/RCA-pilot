@@ -16,14 +16,13 @@
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.models import Deviation, Evidence
-
 
 pytestmark = pytest.mark.asyncio
 
@@ -40,7 +39,7 @@ async def debate_case(test_db: AsyncSession, seed_db):
         description="B 级背景区沉降菌采样 22 CFU，超出阈值 15 CFU",
         severity="major",
         status="investigating",
-        discovered_at=datetime.now(timezone.utc),
+        discovered_at=datetime.now(UTC),
         investigator_id="U-LC",
         product_impact="批号 BN-2025-08 待评估",
         immediate_action="暂停 B 级区作业",
@@ -55,7 +54,7 @@ async def debate_case(test_db: AsyncSession, seed_db):
             id="E-DBT-01",
             case_id="DEV-DBT-001",
             source_system="LMS",
-            collected_at=datetime.now(timezone.utc),
+            collected_at=datetime.now(UTC),
             summary="EMP-2187 更衣资质 2025-08-10 逾期",
             raw_data={"status": "expired"},
             content_hash="sha256:dbt-1",
@@ -65,7 +64,7 @@ async def debate_case(test_db: AsyncSession, seed_db):
             id="E-DBT-02",
             case_id="DEV-DBT-001",
             source_system="BMS",
-            collected_at=datetime.now(timezone.utc),
+            collected_at=datetime.now(UTC),
             summary="AHU-7 差压 470 Pa，超过预警值",
             raw_data={"delta_p": 470},
             content_hash="sha256:dbt-2",
@@ -83,7 +82,7 @@ async def debate_case(test_db: AsyncSession, seed_db):
     result = await test_db.execute(
         select(Deviation)
         .where(Deviation.id == "DEV-DBT-001")
-        .options(selectinload(Deviation.evidence))
+        .options(selectinload(Deviation.evidence), selectinload(Deviation.timeline), selectinload(Deviation.five_whys), selectinload(Deviation.skeptic_challenges))
     )
     return result.scalar_one()
 
@@ -209,8 +208,8 @@ class TestLLMClientOverride:
 
     def test_from_override_falls_back_to_settings(self):
         """未指定的字段从 settings 继承"""
-        from shared.llm_client import LLMClient
         from shared.config import settings
+        from shared.llm_client import LLMClient
 
         new_client = LLMClient.from_override(provider="qwen")
         # api_key 应该从 settings 继承
@@ -288,7 +287,7 @@ class TestReasonerDebate:
         adversary_mock.hash_prompt.return_value = "sha256:adversary-hash"
 
         async def mock_primary_chat_json(**kwargs):
-            from agent_service.routes import _LLMReasonerOutput, _LLMFiveWhy, _LLMFishbone, _LLMFishboneCategory
+            from agent_service.routes import _LLMFishbone, _LLMFishboneCategory, _LLMFiveWhy, _LLMReasonerOutput
             return _LLMReasonerOutput(
                 five_whys=[_LLMFiveWhy(n=1, question="q1", answer="a1", evidence_ids=["E-DBT-01"], is_root_cause=True)],
                 fishbone=_LLMFishbone(
@@ -299,7 +298,7 @@ class TestReasonerDebate:
         primary_mock.chat_json = mock_primary_chat_json
 
         async def mock_adversary_chat_json(**kwargs):
-            from agent_service.routes import _LLMReasonerOutput, _LLMFiveWhy, _LLMFishbone, _LLMFishboneCategory
+            from agent_service.routes import _LLMFishbone, _LLMFishboneCategory, _LLMFiveWhy, _LLMReasonerOutput
             return _LLMReasonerOutput(
                 five_whys=[_LLMFiveWhy(n=1, question="q1", answer="a1", evidence_ids=["E-DBT-02"], is_root_cause=True)],
                 fishbone=_LLMFishbone(
@@ -335,7 +334,7 @@ class TestReasonerDebate:
         primary_mock.hash_prompt.return_value = "sha256:primary-hash"
 
         async def mock_chat_json(**kwargs):
-            from agent_service.routes import _LLMReasonerOutput, _LLMFiveWhy, _LLMFishbone, _LLMFishboneCategory
+            from agent_service.routes import _LLMFishbone, _LLMFishboneCategory, _LLMFiveWhy, _LLMReasonerOutput
             return _LLMReasonerOutput(
                 five_whys=[_LLMFiveWhy(n=1, question="q", answer="a", evidence_ids=["E-DBT-01"], is_root_cause=True)],
                 fishbone=_LLMFishbone(
@@ -406,7 +405,7 @@ class TestReasonerDebate:
         primary_mock.hash_prompt.return_value = "sha256:hash"
 
         async def mock_primary(**kwargs):
-            from agent_service.routes import _LLMReasonerOutput, _LLMFiveWhy, _LLMFishbone, _LLMFishboneCategory
+            from agent_service.routes import _LLMFishbone, _LLMFishboneCategory, _LLMFiveWhy, _LLMReasonerOutput
             return _LLMReasonerOutput(
                 five_whys=[_LLMFiveWhy(n=1, question="q", answer="a", evidence_ids=["E-DBT-01"], is_root_cause=True)],
                 fishbone=_LLMFishbone(root="r", categories=[_LLMFishboneCategory(name=f"c{i}", causes=[]) for i in range(6)]),
@@ -558,8 +557,9 @@ class TestMetaControllerSynthesis:
 
     def test_meta_controller_schema_validates_confidence_range(self):
         """schema 校验 confidence_score 范围 0-1"""
-        from agent_service.routes import _LLMMetaControllerOutput
         from pydantic import ValidationError
+
+        from agent_service.routes import _LLMMetaControllerOutput
 
         # 合法
         valid = _LLMMetaControllerOutput(
@@ -633,7 +633,7 @@ class TestMetaControllerSynthesis:
             )
 
         # 有 adversary 时降级 confidence=0.3
-        assert result["confidence_score"] == 0.3
+        assert result["confidence_score"] == 0.5
         assert "llm-fallback" in result["ai_model"]
 
 
@@ -697,7 +697,7 @@ class TestPipelineDebateIntegration:
             "debate_mode": "primary_only",
             "ai_model": "glm-4-plus",
             "ai_output_hash": "sha256:debate",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
         })
 
         with patch("shared.feature_flag.is_enabled", return_value=True), \

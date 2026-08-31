@@ -1,4 +1,4 @@
-# RCA Pilot Backend Dockerfile — 通用镜像（所有微服务共用）
+# RCA Pilot Backend Dockerfile — 通用镜像（所有微服务共用，非 root 运行）
 FROM python:3.11-slim
 
 # 设置工作目录
@@ -27,6 +27,11 @@ COPY backend /app/backend
 
 # 设置 Python 路径 — 包含 /app 和 /app/backend，使得 `from shared.xxx` 和 `from backend.shared.xxx` 均可工作
 ENV PYTHONPATH=/app:/app/backend
+
+# 非 root 运行 —— 降低容器逃逸风险
+RUN useradd --create-home --shell /usr/sbin/nologin appuser \
+    && chown -R appuser:appuser /app
+USER appuser
 
 # 默认启动 auth-service（被 docker-compose 覆盖）
 CMD ["uvicorn", "auth_service.main:app", "--host", "0.0.0.0", "--port", "8001"]

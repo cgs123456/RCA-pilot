@@ -57,7 +57,7 @@ export interface Deviation {
   immediate_action?: string;
   progress: number;
   hitl_gates: Record<string, HitlGateStatus>;
-  meta: Record<string, any>;
+  meta: Record<string, unknown>;
   created_at: string;
   updated_at: string;
   investigator?: User;
@@ -70,7 +70,7 @@ export interface Evidence {
   source_system: SourceSystem;
   collected_at: string;
   summary?: string;
-  raw_data: Record<string, any>;
+  raw_data: Record<string, unknown>;
   content_hash: string;
   confidence: number;
   is_signed: boolean;
@@ -155,9 +155,10 @@ export interface AgentRun {
   case_id: string;
   status: string;
   current_agent?: string;
+  error_message?: string;
   started_at?: string;
   completed_at?: string;
-  agent_states: Record<string, any>;
+  agent_states: Record<string, unknown>;
   triggered_by: string;
   created_at: string;
 }

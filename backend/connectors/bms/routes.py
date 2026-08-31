@@ -1,12 +1,13 @@
 """BMS Mock Connector — 楼宇管理系统 HVAC 只读 API"""
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import List, Optional
+from datetime import UTC, datetime
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 
-router = APIRouter(prefix="/bms", tags=["bms-connector"])
+from shared.connector_auth import require_connector_auth
+
+router = APIRouter(prefix="/bms", tags=["bms-connector"], dependencies=[Depends(require_connector_auth)])
 
 
 # ============================================================
@@ -97,7 +98,7 @@ async def health():
     return {
         "status": "healthy",
         "service": "bms-connector",
-        "data_freshness": "2025-08-17T06:00:00+08:00",
+        "data_freshness": datetime.now(UTC).astimezone().isoformat(),
         "is_readonly": True,
     }
 
@@ -108,7 +109,7 @@ async def list_ahus() -> dict:
     return {
         "status": "ok",
         "source": "BMS",
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "fetched_at": datetime.now(UTC).isoformat(),
         "total": len(AHUS),
         "items": [
             {
@@ -127,7 +128,7 @@ async def list_ahus() -> dict:
 @router.get("/ahus/{ahu_id}/history", summary="查询 AHU 历史时序数据")
 async def get_ahu_history(
     ahu_id: str,
-    param: Optional[str] = Query(default=None, description="参数名：delta_p_pa / temperature_c / humidity_pct"),
+    param: str | None = Query(default=None, description="参数名：delta_p_pa / temperature_c / humidity_pct"),
 ) -> dict:
     """查询指定 AHU 的参数历史时序数据
 
@@ -147,7 +148,7 @@ async def get_ahu_history(
     return {
         "status": "ok",
         "source": "BMS",
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "fetched_at": datetime.now(UTC).isoformat(),
         "ahu_id": ahu_id,
         "area": ahu["area"],
         "params": ahu["params"],
@@ -157,7 +158,7 @@ async def get_ahu_history(
 
 @router.get("/anomalies", summary="查询 BMS 异常/告警事件")
 async def list_anomalies(
-    level: Optional[str] = Query(default=None, description="过滤级别：warning / alert / action"),
+    level: str | None = Query(default=None, description="过滤级别：warning / alert / action"),
 ) -> dict:
     """查询 BMS 所有异常/告警事件 — 用于偏差调查证据收集
 
@@ -173,7 +174,7 @@ async def list_anomalies(
     return {
         "status": "ok",
         "source": "BMS",
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "fetched_at": datetime.now(UTC).isoformat(),
         "total": len(items),
         "items": items,
     }

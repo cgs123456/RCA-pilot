@@ -1,12 +1,13 @@
 """LMS Mock Connector — 培训管理系统只读 API"""
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import List, Optional
+from datetime import UTC, datetime
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 
-router = APIRouter(prefix="/lms", tags=["lms-connector"])
+from shared.connector_auth import require_connector_auth
+
+router = APIRouter(prefix="/lms", tags=["lms-connector"], dependencies=[Depends(require_connector_auth)])
 
 
 # ============================================================
@@ -93,14 +94,14 @@ async def health():
     return {
         "status": "healthy",
         "service": "lms-connector",
-        "data_freshness": "2025-08-17T06:00:00+08:00",
+        "data_freshness": datetime.now(UTC).astimezone().isoformat(),
         "is_readonly": True,
     }
 
 
 @router.get("/cert-status", summary="查询员工资质状态")
 async def get_cert_status(
-    employee_id: Optional[str] = Query(default=None, description="员工 ID"),
+    employee_id: str | None = Query(default=None, description="员工 ID"),
 ) -> dict:
     """查询员工资质状态 — 返回资质、培训记录、告警日志
 
@@ -117,7 +118,7 @@ async def get_cert_status(
         return {
             "status": "ok",
             "source": "LMS",
-            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "fetched_at": datetime.now(UTC).isoformat(),
             "employee": emp,
         }
 
@@ -125,7 +126,7 @@ async def get_cert_status(
     return {
         "status": "ok",
         "source": "LMS",
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "fetched_at": datetime.now(UTC).isoformat(),
         "total": len(EMPLOYEES),
         "employees": [
             {
@@ -157,7 +158,7 @@ async def list_expired_certs() -> dict:
     return {
         "status": "ok",
         "source": "LMS",
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "fetched_at": datetime.now(UTC).isoformat(),
         "total_expired": len(expired),
         "items": expired,
     }
@@ -165,22 +166,29 @@ async def list_expired_certs() -> dict:
 
 @router.get("/alert-log", summary="查询 LMS 告警日志")
 async def get_alert_log(
-    employee_id: Optional[str] = Query(default=None),
+    employee_id: str | None = Query(default=None),
 ) -> dict:
     """查询 LMS 告警日志
 
-    关键发现：EMP-2187 资质逾期但告警日志为空 — LMS 与排班系统未集成
+    数据驱动判定：Mock 告警日志表恒为空 —— 任何资质已逾期的员工都构成
+    "应触发告警但未触发" 异常发现（不再特判特定员工）。
     """
-    if employee_id == "EMP-2187":
-        return {
-            "status": "ok",
-            "source": "LMS",
-            "employee_id": employee_id,
-            "expected_alert_date": "2025-08-03",
-            "actual_alerts": [],
-            "finding": "LMS 与排班系统无资质门控集成 — 资质逾期未触发告警",
-            "is_anomaly": True,
-        }
+    if employee_id:
+        emp = EMPLOYEES.get(employee_id)
+        expired = [
+            c for c in (emp.get("certifications", []) if emp else [])
+            if c.get("status") == "expired"
+        ]
+        if expired:
+            return {
+                "status": "ok",
+                "source": "LMS",
+                "employee_id": employee_id,
+                "expired_certs": [c["cert_id"] for c in expired],
+                "actual_alerts": [],
+                "finding": "LMS 与排班系统无资质门控集成 — 资质逾期未触发告警",
+                "is_anomaly": True,
+            }
 
     return {
         "status": "ok",

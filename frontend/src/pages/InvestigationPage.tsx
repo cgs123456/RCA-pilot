@@ -1,5 +1,8 @@
 /**
- * 调查工作台 — 案例详情 + HITL 关卡 + Agent 运行
+ * 调查工作台 — 案例详情 + HITL 关卡审批 + Agent 运行控制
+ *
+ * 核心修复：HITL 审批 UI（旧版 hitlMutation 是从未调用的死代码，5 道关卡无法通过）；
+ * Agent 流水线状态轮询（旧版启动后界面永久停留在快照）；暂停/取消/恢复控制。
  */
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
@@ -8,19 +11,23 @@ import {
   ArrowLeft, Play, CheckCircle, XCircle, Edit3,
   Clock, User, MapPin, Calendar, AlertTriangle,
   Activity, FileText, Shield, FlaskConical, Brain,
-  ChevronDown, ChevronRight, Hash, Zap,
+  Zap, Pause, Ban, RotateCcw, Pencil,
 } from 'lucide-react';
 import { caseApi } from '@/services/case.service';
 import { agentApi } from '@/services/agent.service';
 import { Card, CardBody, CardHeader, CardTitle } from '@/components/ui/Card';
 import { Badge } from '@/components/ui/Badge';
 import { Button } from '@/components/ui/Button';
+import { useToast } from '@/components/ui/Toast';
 import {
   formatDateTime, severityBadgeClass, severityLabel,
   sourceBadgeClass, statusBadgeClass, statusLabel, gateLabel, shortHash,
   roleLabel,
 } from '@/lib/utils';
-import type { DeviationDetail, HitlAction } from '@/types';
+import type {
+  DeviationDetail, HitlAction, TimelineEvent, Evidence, FiveWhy,
+  SkepticChallenge, AgentRun,
+} from '@/types';
 
 const GATES = ['gate1', 'gate2', 'gate3', 'gate4', 'gate5'];
 
@@ -36,35 +43,80 @@ const TABS = [
 export function InvestigationPage() {
   const { caseId = '' } = useParams();
   const queryClient = useQueryClient();
+  const { toast } = useToast();
   const [tab, setTab] = useState('timeline');
   const [runAgentModal, setRunAgentModal] = useState(false);
 
-  const { data: detail, isLoading } = useQuery<DeviationDetail>({
+  const { data: detail, isLoading, isError, refetch } = useQuery<DeviationDetail>({
     queryKey: ['case', caseId],
     queryFn: () => caseApi.get(caseId),
     enabled: !!caseId,
   });
 
+  // 流水线进行中每 3s 轮询进度（旧版从不轮询，界面永久停留在快照）
   const { data: agentRuns } = useQuery({
     queryKey: ['agent-runs', caseId],
     queryFn: () => agentApi.list({ case_id: caseId, page: 1, page_size: 5 }),
     enabled: !!caseId,
+    refetchInterval: (query) => {
+      const items = query.state.data?.items ?? [];
+      const hasActive = items.some((r) => r.status === 'running' || r.status === 'pending');
+      return hasActive ? 3000 : false;
+    },
   });
 
+  const invalidateCaseData = () => {
+    queryClient.invalidateQueries({ queryKey: ['case', caseId] });
+    queryClient.invalidateQueries({ queryKey: ['agent-runs', caseId] });
+    queryClient.invalidateQueries({ queryKey: ['cases'] });
+    queryClient.invalidateQueries({ queryKey: ['kpi'] });
+  };
+
+  // HITL 审批 mutation —— 旧版定义后从未调用（死代码），本版接入完整审批 UI
   const hitlMutation = useMutation({
-    mutationFn: ({ gateId, action, comment }: { gateId: string; action: HitlAction; comment?: string }) =>
-      caseApi.hitl(caseId, gateId, action, comment),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['case', caseId] });
+    mutationFn: ({
+      gateId, action, comment, editPayload,
+    }: {
+      gateId: string;
+      action: HitlAction;
+      comment?: string;
+      editPayload?: { five_whys: { n: number; why_text: string }[] };
+    }) => caseApi.hitl(caseId, gateId, action, comment, editPayload),
+    onSuccess: (data) => {
+      invalidateCaseData();
+      if (data.all_gates_passed) {
+        toast('全部关卡已通过，案例进入审核（reviewing）状态', 'success');
+      } else {
+        toast(`${gateLabel(data.gate_id)} 处理完成`, 'success');
+      }
     },
+    onError: (e) => toast((e as { message?: string })?.message || 'HITL 操作失败', 'error'),
   });
 
   const runAgentMutation = useMutation({
     mutationFn: () => agentApi.run(caseId),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['agent-runs', caseId] });
+      invalidateCaseData();
       setRunAgentModal(false);
+      toast('Agent 流水线已启动', 'success');
     },
+    onError: (e) => toast((e as { message?: string })?.message || '启动失败（可能已有进行中的流水线）', 'error'),
+  });
+
+  const runControlMutation = useMutation({
+    mutationFn: ({ runId, op }: { runId: string; op: 'pause' | 'cancel' | 'resume' }) => {
+      if (op === 'pause') return agentApi.pause(runId);
+      if (op === 'cancel') return agentApi.cancel(runId);
+      return agentApi.resume(runId);
+    },
+    onSuccess: (_d, vars) => {
+      invalidateCaseData();
+      toast(
+        vars.op === 'pause' ? '流水线已暂停' : vars.op === 'cancel' ? '流水线已取消' : '流水线已恢复',
+        'success',
+      );
+    },
+    onError: (e) => toast((e as { message?: string })?.message || '操作失败', 'error'),
   });
 
   if (isLoading) {
@@ -73,6 +125,19 @@ export function InvestigationPage() {
         <div className="shimmer h-8 w-1/2 rounded" />
         <div className="shimmer h-32 rounded" />
         <div className="shimmer h-64 rounded" />
+      </div>
+    );
+  }
+
+  if (isError) {
+    return (
+      <div className="p-6">
+        <Card>
+          <CardBody className="text-center py-12">
+            <div className="text-danger-600 text-sm mb-2">案例加载失败</div>
+            <button onClick={() => refetch()} className="text-xs text-brand-600 hover:underline">重试</button>
+          </CardBody>
+        </Card>
       </div>
     );
   }
@@ -91,6 +156,10 @@ export function InvestigationPage() {
       </div>
     );
   }
+
+  const gates = detail.hitl_gates || {};
+  const latestRun = agentRuns?.items?.[0];
+  const pipelineActive = latestRun?.status === 'running' || latestRun?.status === 'pending';
 
   return (
     <div className="flex flex-col h-full">
@@ -113,6 +182,8 @@ export function InvestigationPage() {
             variant="primary"
             size="sm"
             onClick={() => setRunAgentModal(true)}
+            disabled={pipelineActive}
+            title={pipelineActive ? '已有进行中的流水线' : undefined}
           >
             <Play className="w-3.5 h-3.5" /> 启动 Agent
           </Button>
@@ -150,10 +221,10 @@ export function InvestigationPage() {
           )}
         </div>
 
-        {/* HITL 关卡进度条 */}
+        {/* HITL 关卡进度条（每关带状态徽章，审批按钮在下方 HITL 面板） */}
         <div className="mt-4 flex items-center gap-2">
           {GATES.map((g, i) => {
-            const status = detail.hitl_gates?.[g] || 'pending';
+            const status = gates[g] || 'pending';
             return (
               <div key={g} className="flex items-center">
                 <div
@@ -180,6 +251,17 @@ export function InvestigationPage() {
           </div>
         </div>
       </div>
+
+      {/* HITL 审批面板 —— GxP 核心交互：5 道关卡按顺序审批 */}
+      {detail.status !== 'closed' && (
+        <HitlPanel
+          gates={gates}
+          detail={detail}
+          pending={hitlMutation.isPending}
+          onSubmit={(gateId, action, comment, editPayload) =>
+            hitlMutation.mutate({ gateId, action, comment, editPayload })}
+        />
+      )}
 
       {/* 描述 + 立即措施 */}
       {(detail.description || detail.immediate_action) && (
@@ -243,9 +325,10 @@ export function InvestigationPage() {
         {tab === 'skeptic' && <SkepticTab challenges={detail.skeptic_challenges} />}
         {tab === 'agent' && (
           <AgentTab
-            caseId={caseId}
             runs={agentRuns?.items || []}
+            controlPending={runControlMutation.isPending}
             onRunAgent={() => setRunAgentModal(true)}
+            onControl={(runId, op) => runControlMutation.mutate({ runId, op })}
           />
         )}
         {tab === 'report' && <ReportTab detail={detail} />}
@@ -291,8 +374,128 @@ export function InvestigationPage() {
   );
 }
 
+// ============================================================
+// HITL 审批面板
+// ============================================================
+function HitlPanel({
+  gates, detail, pending, onSubmit,
+}: {
+  gates: Record<string, string>;
+  detail: DeviationDetail;
+  pending: boolean;
+  onSubmit: (
+    gateId: string,
+    action: HitlAction,
+    comment?: string,
+    editPayload?: { five_whys: { n: number; why_text: string }[] },
+  ) => void;
+}) {
+  // 按顺序找到第一个可处理的关卡：未 done 的第一关
+  const currentGateIdx = GATES.findIndex((g) => gates[g] !== 'done');
+  const currentGate = currentGateIdx === -1 ? null : GATES[currentGateIdx];
+
+  const [comment, setComment] = useState('');
+  const [editing, setEditing] = useState(false);
+  const [editTexts, setEditTexts] = useState<Record<number, string>>({});
+
+  if (!currentGate || detail.status === 'closed') return null;
+  const isGate2 = currentGate === 'gate2';
+
+  const submit = (action: HitlAction) => {
+    const editPayload =
+      action === 'edit' && isGate2
+        ? {
+            five_whys: Object.entries(editTexts).map(([n, why_text]) => ({
+              n: Number(n),
+              why_text,
+            })),
+          }
+        : undefined;
+    onSubmit(currentGate, action, comment || undefined, editPayload);
+    setComment('');
+    setEditing(false);
+    setEditTexts({});
+  };
+
+  return (
+    <div className="bg-brand-50/60 border-b border-brand-100 px-6 py-3">
+      <div className="flex items-center gap-2 mb-2">
+        <Shield className="w-4 h-4 text-brand-600" />
+        <span className="text-xs font-semibold text-brand-700">
+          HITL 人工决策 — {gateLabel(currentGate)}（第 {currentGateIdx + 1}/5 关）
+        </span>
+        {currentGateIdx > 0 && (
+          <span className="text-[10px] text-ink-400">前置关卡已全部通过</span>
+        )}
+      </div>
+
+      {isGate2 && editing ? (
+        /* gate2 编辑模式：逐条修改 5 Whys 答案 */
+        <div className="space-y-2">
+          {detail.five_whys.map((w) => (
+            <div key={w.id} className="flex items-start gap-2">
+              <span className="w-5 h-5 rounded-full bg-brand-100 text-brand-700 flex items-center justify-center text-[10px] font-semibold mt-1">
+                {w.n}
+              </span>
+              <textarea
+                value={editTexts[w.n] ?? w.answer ?? ''}
+                onChange={(e) => setEditTexts((prev) => ({ ...prev, [w.n]: e.target.value }))}
+                rows={2}
+                className="flex-1 text-xs rounded-md border border-ink-200 bg-white px-2 py-1.5 focus:outline-none focus:ring-2 focus:ring-brand-500"
+                placeholder={`Why #${w.n} 的答案`}
+              />
+            </div>
+          ))}
+          <div className="flex items-center gap-2 justify-end">
+            <input
+              type="text"
+              value={comment}
+              onChange={(e) => setComment(e.target.value)}
+              placeholder="编辑说明（写入审计日志）"
+              className="h-8 text-xs rounded-md border border-ink-200 bg-white px-2 w-64"
+            />
+            <Button variant="outline" size="sm" onClick={() => setEditing(false)} disabled={pending}>
+              取消
+            </Button>
+            <Button size="sm" onClick={() => submit('edit')} disabled={pending}>
+              <Pencil className="w-3 h-3" /> 保存编辑
+            </Button>
+          </div>
+        </div>
+      ) : (
+        <div className="flex items-center gap-2 flex-wrap">
+          <input
+            type="text"
+            value={comment}
+            onChange={(e) => setComment(e.target.value)}
+            placeholder="审批意见（可选，写入审计日志）"
+            className="h-8 flex-1 min-w-48 text-xs rounded-md border border-ink-200 bg-white px-2"
+          />
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => submit('reject')}
+            disabled={pending}
+            className="text-danger-600 border-danger-200 hover:bg-danger-50"
+          >
+            <XCircle className="w-3.5 h-3.5" /> 拒绝
+          </Button>
+          {isGate2 && detail.five_whys.length > 0 && (
+            <Button variant="outline" size="sm" onClick={() => setEditing(true)} disabled={pending}>
+              <Edit3 className="w-3.5 h-3.5" /> 修改 5 Whys
+            </Button>
+          )}
+          <Button size="sm" onClick={() => submit('accept')} disabled={pending}>
+            <CheckCircle className="w-3.5 h-3.5" /> 通过
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ---- Timeline ----
-function TimelineTab({ events }: { events: any[] }) {
+function TimelineTab({ events }: { events: TimelineEvent[] }) {
   if (!events?.length) return <EmptyTab text="暂无时间线事件" />;
   return (
     <div className="max-w-3xl mx-auto">
@@ -303,7 +506,7 @@ function TimelineTab({ events }: { events: any[] }) {
             <Card className={e.is_anomaly ? 'border-danger-200' : ''}>
               <CardBody className="py-2.5 px-4">
                 <div className="flex items-center gap-2 mb-1">
-                  <span className="text-xs font-mono text-ink-500">{e.occurred_at}</span>
+                  <span className="text-xs font-mono text-ink-500">{formatDateTime(e.occurred_at)}</span>
                   <span className={`text-[10px] px-1.5 py-0.5 rounded ${sourceBadgeClass(e.source || '')}`}>
                     {e.source || '—'}
                   </span>
@@ -326,7 +529,7 @@ function TimelineTab({ events }: { events: any[] }) {
 }
 
 // ---- Evidence ----
-function EvidenceTab({ evidence }: { evidence: any[] }) {
+function EvidenceTab({ evidence }: { evidence: Evidence[] }) {
   if (!evidence?.length) return <EmptyTab text="暂无证据" />;
   return (
     <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
@@ -355,7 +558,7 @@ function EvidenceTab({ evidence }: { evidence: any[] }) {
 }
 
 // ---- 5 Whys ----
-function FiveWhysTab({ whys }: { whys: any[] }) {
+function FiveWhysTab({ whys }: { whys: FiveWhy[] }) {
   if (!whys?.length) return <EmptyTab text="暂无 5 Whys 推理" />;
   return (
     <div className="max-w-3xl mx-auto space-y-3">
@@ -400,7 +603,7 @@ function FiveWhysTab({ whys }: { whys: any[] }) {
 }
 
 // ---- Skeptic ----
-function SkepticTab({ challenges }: { challenges: any[] }) {
+function SkepticTab({ challenges }: { challenges: SkepticChallenge[] }) {
   if (!challenges?.length) return <EmptyTab text="暂无 Skeptic 反例挑战" />;
   return (
     <div className="max-w-3xl mx-auto space-y-3">
@@ -442,8 +645,15 @@ function SkepticTab({ challenges }: { challenges: any[] }) {
   );
 }
 
-// ---- Agent 运行 ----
-function AgentTab({ caseId, runs, onRunAgent }: { caseId: string; runs: any[]; onRunAgent: () => void }) {
+// ---- Agent 运行（含暂停/取消/恢复控制）----
+function AgentTab({
+  runs, controlPending, onRunAgent, onControl,
+}: {
+  runs: AgentRun[];
+  controlPending: boolean;
+  onRunAgent: () => void;
+  onControl: (runId: string, op: 'pause' | 'cancel' | 'resume') => void;
+}) {
   if (!runs.length) {
     return (
       <EmptyTab
@@ -457,60 +667,97 @@ function AgentTab({ caseId, runs, onRunAgent }: { caseId: string; runs: any[]; o
       {runs.map((r) => (
         <Card key={r.id}>
           <CardHeader>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
               <Activity className="w-4 h-4 text-brand-500" />
               <span className="text-xs font-mono text-ink-500">{r.id}</span>
               <Badge variant={
                 r.status === 'completed' ? 'success' :
                 r.status === 'running' ? 'brand' :
-                r.status === 'failed' ? 'danger' : 'default'
+                r.status === 'failed' || r.status === 'cancelled' ? 'danger' : 'default'
               }>
-                {r.status}
+                {r.status === 'cancelled' ? '已取消' : r.status}
               </Badge>
               {r.current_agent && (
                 <span className="text-xs text-ink-500">当前: {r.current_agent}</span>
               )}
+              {/* 流水线控制按钮 */}
+              <div className="flex items-center gap-1 ml-2">
+                {(r.status === 'running' || r.status === 'pending') && (
+                  <>
+                    <Button
+                      variant="ghost" size="sm"
+                      disabled={controlPending}
+                      onClick={() => onControl(r.id, 'pause')}
+                      title="暂停（当前阶段完成后停止）"
+                    >
+                      <Pause className="w-3.5 h-3.5" /> 暂停
+                    </Button>
+                    <Button
+                      variant="ghost" size="sm"
+                      disabled={controlPending}
+                      onClick={() => onControl(r.id, 'cancel')}
+                      title="取消（终态）"
+                      className="text-danger-600"
+                    >
+                      <Ban className="w-3.5 h-3.5" /> 取消
+                    </Button>
+                  </>
+                )}
+                {r.status === 'paused' && (
+                  <Button
+                    variant="ghost" size="sm"
+                    disabled={controlPending}
+                    onClick={() => onControl(r.id, 'resume')}
+                    title="恢复（重新执行各阶段）"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" /> 恢复
+                  </Button>
+                )}
+              </div>
             </div>
             <span className="text-xs text-ink-400">{formatDateTime(r.created_at)}</span>
           </CardHeader>
           <CardBody>
+            {r.error_message && (
+              <div className="mb-2 text-xs text-danger-600 p-2 bg-danger-50 rounded">
+                {r.error_message}
+              </div>
+            )}
             {/* Agent 状态时间线 */}
             <div className="space-y-2">
-              {Object.entries(r.agent_states || {}).map(([agent, state]: [string, any]) => (
-                <div key={agent} className="flex items-start gap-2">
-                  <div className={`w-6 h-6 rounded-full flex items-center justify-center text-[10px] ${
-                    state.status === 'completed' ? 'bg-success-50 text-success-600' :
-                    state.status === 'running' ? 'bg-brand-50 text-brand-600 animate-pulse-dot' :
-                    'bg-ink-100 text-ink-500'
-                  }`}>
-                    {state.status === 'completed' ? '✓' : state.status === 'running' ? '●' : '○'}
+              {Object.entries(r.agent_states || {}).map(([agent, state]) => {
+                const st = state as { status?: string; summary?: string; root_cause_summary?: string; challenges?: unknown[]; ai_output_hash?: string };
+                return (
+                  <div key={agent} className="flex items-start gap-2">
+                    <div className={`w-6 h-6 rounded-full flex items-center justify-center text-[10px] ${
+                      st.status === 'completed' ? 'bg-success-50 text-success-600' :
+                      st.status === 'running' ? 'bg-brand-50 text-brand-600 animate-pulse-dot' :
+                      'bg-ink-100 text-ink-500'
+                    }`}>
+                      {st.status === 'completed' ? '✓' : st.status === 'running' ? '●' : '○'}
+                    </div>
+                    <div className="flex-1">
+                      <div className="text-xs font-medium text-ink-800">{agent}</div>
+                      {st.summary && <div className="text-xs text-ink-600 mt-0.5">{st.summary}</div>}
+                      {st.root_cause_summary && (
+                        <div className="text-xs text-ink-700 mt-1 p-2 bg-ink-50 rounded">
+                          {st.root_cause_summary}
+                        </div>
+                      )}
+                      {st.challenges && st.challenges.length > 0 && (
+                        <div className="text-xs text-ink-600 mt-1">
+                          生成 {st.challenges.length} 条反例挑战
+                        </div>
+                      )}
+                      {st.ai_output_hash && (
+                        <div className="text-[10px] text-ink-400 font-mono mt-1">
+                          输出 hash: {shortHash(st.ai_output_hash)}
+                        </div>
+                      )}
+                    </div>
                   </div>
-                  <div className="flex-1">
-                    <div className="text-xs font-medium text-ink-800">{agent}</div>
-                    {state.summary && <div className="text-xs text-ink-600 mt-0.5">{state.summary}</div>}
-                    {state.root_cause_summary && (
-                      <div className="text-xs text-ink-700 mt-1 p-2 bg-ink-50 rounded">
-                        {state.root_cause_summary}
-                      </div>
-                    )}
-                    {state.challenges && state.challenges.length > 0 && (
-                      <div className="text-xs text-ink-600 mt-1">
-                        生成 {state.challenges.length} 条反例挑战
-                      </div>
-                    )}
-                    {state.checks && (
-                      <div className="text-xs text-ink-600 mt-1">
-                        {state.summary}
-                      </div>
-                    )}
-                    {state.ai_output_hash && (
-                      <div className="text-[10px] text-ink-400 font-mono mt-1">
-                        输出 hash: {shortHash(state.ai_output_hash)}
-                      </div>
-                    )}
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </CardBody>
         </Card>
@@ -530,6 +777,9 @@ function ReportTab({ detail }: { detail: DeviationDetail }) {
           <Badge variant="brand">ICH Q9 模板</Badge>
         </CardHeader>
         <CardBody>
+          <div className="mb-2 text-[10px] text-warning-600">
+            前端模板拼装的预览草稿 — 正式报告以 Agent Drafter 产出（Agent 运行 Tab）并经 HITL/签发的版本为准。
+          </div>
           <pre className="text-xs text-ink-700 whitespace-pre-wrap font-sans leading-relaxed">
             {report}
           </pre>
@@ -540,7 +790,7 @@ function ReportTab({ detail }: { detail: DeviationDetail }) {
 }
 
 function generateReport(d: DeviationDetail): string {
-  return `偏差调查报告 — ${d.id}
+  return `偏差调查报告 - ${d.id}
 
 1. 偏差描述
 ${d.description || '—'}

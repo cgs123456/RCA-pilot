@@ -1,7 +1,7 @@
 /**
  * 调查收件箱 — 偏差案例列表 + 筛选
  */
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 import { Search, Filter, Plus, Calendar, User, MapPin } from 'lucide-react';
@@ -29,16 +29,27 @@ const SEVERITY_FILTERS = [
   { value: 'minor', label: '次要' },
 ];
 
+// 300ms 防抖 —— 旧版逐键发请求
+function useDebouncedValue<T>(value: T, delay = 300): T {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const t = window.setTimeout(() => setDebounced(value), delay);
+    return () => window.clearTimeout(t);
+  }, [value, delay]);
+  return debounced;
+}
+
 export function InboxPage() {
   const [keyword, setKeyword] = useState('');
+  const debouncedKeyword = useDebouncedValue(keyword);
   const [status, setStatus] = useState('');
   const [severity, setSeverity] = useState('');
   const [page, setPage] = useState(1);
 
-  const { data, isLoading } = useQuery({
-    queryKey: ['cases', { keyword, status, severity, page }],
+  const { data, isLoading, isError, refetch } = useQuery({
+    queryKey: ['cases', { keyword: debouncedKeyword, status, severity, page }],
     queryFn: () => caseApi.list({
-      keyword: keyword || undefined,
+      keyword: debouncedKeyword || undefined,
       status: status || undefined,
       severity: severity || undefined,
       page,
@@ -127,7 +138,16 @@ export function InboxPage() {
           </>
         )}
 
-        {!isLoading && data?.items?.length === 0 && (
+        {isError && (
+          <Card>
+            <CardBody className="text-center py-12">
+              <div className="text-danger-600 text-sm mb-2">案例列表加载失败</div>
+              <button onClick={() => refetch()} className="text-xs text-brand-600 hover:underline">重试</button>
+            </CardBody>
+          </Card>
+        )}
+
+        {!isLoading && !isError && data?.items?.length === 0 && (
           <Card>
             <CardBody className="text-center py-12">
               <div className="text-ink-400 text-sm">没有匹配的案例</div>
@@ -135,7 +155,7 @@ export function InboxPage() {
           </Card>
         )}
 
-        {!isLoading && data?.items?.map((c) => (
+        {!isLoading && !isError && data?.items?.map((c) => (
           <Link key={c.id} to={`/investigation/${c.id}`}>
             <Card className="card-hover cursor-pointer">
               <CardBody>

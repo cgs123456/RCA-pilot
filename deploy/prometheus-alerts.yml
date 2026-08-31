@@ -1,0 +1,68 @@
+# RCA Pilot 告警规则 —— Prometheus rule_files 引用
+# GxP 系统需要可证明的持续监控：以下为最小可用告警集
+groups:
+  - name: rca-pilot-availability
+    rules:
+      - alert: ServiceDown
+        expr: up{app="rca-pilot"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "RCA Pilot 服务实例宕机: {{ $labels.job }}/{{ $labels.instance }}"
+          description: "实例已持续 5 分钟不可抓取（up==0），请检查容器状态与 /health。"
+
+      - alert: HighErrorRate
+        expr: |
+          (
+            sum(rate(http_errors_total{app="rca-pilot"}[5m])) by (service)
+            /
+            clamp_min(sum(rate(http_requests_total{app="rca-pilot"}[5m])) by (service), 0.001)
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "HTTP 5xx 错误率超过 5%: {{ $labels.service }}"
+          description: "最近 5 分钟 5xx 错误率超过 5%，可能存在业务或基础设施故障。"
+
+      - alert: HighP99Latency
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(http_request_duration_seconds_bucket{app="rca-pilot"}[5m])) by (le, service)
+          ) > 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "P99 延迟超过 2s: {{ $labels.service }}"
+          description: "最近 5 分钟 P99 请求延迟超过 2 秒。"
+
+  - name: rca-pilot-business
+    rules:
+      - alert: AgentPipelineFailureSpike
+        expr: sum(rate(rca_agent_runs_total{status="failed"}[15m])) > 0.1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Agent 流水线失败率异常"
+          description: "最近 15 分钟失败流水线速率超过 0.1/s，请检查 agent-service 日志与 LLM 配置。"
+
+      - alert: AuditWriteStalled
+        expr: increase(rca_audit_logs_total[1h]) == 0
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "审计日志 1 小时无新增"
+          description: "审计日志 1 小时零增长 —— 系统可能无人使用或审计写入通路故障（GxP 关注项）。"
+
+      - alert: DatabasePoolSaturation
+        expr: db_pool_checked_out / clamp_min(db_pool_size, 1) > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DB 连接池使用率超过 90%: {{ $labels.service }}"
+          description: "连接池接近耗尽，请求将排队或超时。"

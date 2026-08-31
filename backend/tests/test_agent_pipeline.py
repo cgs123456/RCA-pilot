@@ -11,13 +11,12 @@
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.models import Deviation, Evidence
-
 
 pytestmark = pytest.mark.asyncio
 
@@ -30,7 +29,7 @@ async def agent_case(test_db: AsyncSession, seed_db):
         title="Agent 测试案例",
         severity="major",
         status="investigating",
-        discovered_at=datetime.now(timezone.utc),
+        discovered_at=datetime.now(UTC),
         investigator_id="U-LC",
         progress=30,
         hitl_gates={
@@ -50,7 +49,7 @@ async def agent_case(test_db: AsyncSession, seed_db):
             id="E-TEST-01",
             case_id="DEV-AGENT-001",
             source_system="LIMS",
-            collected_at=datetime.now(timezone.utc),
+            collected_at=datetime.now(UTC),
             summary="LIMS 检测结果超标",
             raw_data={"cfu": 22, "threshold": 15},
             content_hash="sha256:test1",
@@ -60,7 +59,7 @@ async def agent_case(test_db: AsyncSession, seed_db):
             id="E-TEST-02",
             case_id="DEV-AGENT-001",
             source_system="LMS",
-            collected_at=datetime.now(timezone.utc),
+            collected_at=datetime.now(UTC),
             summary="EMP-2187 资质已逾期",
             raw_data={"status": "expired"},
             content_hash="sha256:test2",
@@ -70,7 +69,7 @@ async def agent_case(test_db: AsyncSession, seed_db):
             id="E-TEST-03",
             case_id="DEV-AGENT-001",
             source_system="BMS",
-            collected_at=datetime.now(timezone.utc),
+            collected_at=datetime.now(UTC),
             summary="AHU-7 差压异常上升",
             raw_data={"delta_p": 470},
             content_hash="sha256:test3",
@@ -88,7 +87,7 @@ async def agent_case(test_db: AsyncSession, seed_db):
     result = await test_db.execute(
         select(Deviation)
         .where(Deviation.id == "DEV-AGENT-001")
-        .options(selectinload(Deviation.evidence))
+        .options(selectinload(Deviation.evidence), selectinload(Deviation.five_whys))
     )
     return result.scalar_one()
 

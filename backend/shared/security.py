@@ -4,8 +4,8 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Literal, Optional
+from datetime import UTC, datetime, timedelta
+from typing import Any, Literal
 
 import bcrypt
 import jwt
@@ -15,24 +15,30 @@ from .exceptions import AuthError, ForbiddenError
 
 # ---- 密码哈希 ----
 # 直接使用 bcrypt（绕过 passlib 1.7.4 与 bcrypt 4.x 的兼容问题）
-# bcrypt 限制密码 ≤72 字节，对超长密码截断前 72 字节（与 passlib 行为一致）
+# bcrypt 限制密码 ≤72 字节：新哈希对超长密码直接拒绝（截断会静默削减熵），
+# 旧哈希校验时仍按截断处理以保持兼容。
 _BCRYPT_MAX_BYTES = 72
 
 
 def _truncate(password: str) -> bytes:
-    """bcrypt 限制密码长度 ≤72 字节，超长截断（与 passlib 默认行为一致）"""
+    """bcrypt 限制密码长度 ≤72 字节，超长截断（仅用于校验旧哈希）"""
     raw = password.encode("utf-8")
     return raw[:_BCRYPT_MAX_BYTES]
 
 
 def hash_password(password: str) -> str:
-    """bcrypt 哈希 — 返回字符串形式（含算法/成本/盐/哈希）"""
+    """bcrypt 哈希 — 返回字符串形式（含算法/成本/盐/哈希）
+
+    超过 bcrypt 72 字节限制的密码直接拒绝，避免静默截断降低熵。
+    """
+    if len(password.encode("utf-8")) > _BCRYPT_MAX_BYTES:
+        raise ValueError("密码长度超过 72 字节限制，请使用更短的密码")
     salt = bcrypt.gensalt()
     hashed = bcrypt.hashpw(_truncate(password), salt)
     return hashed.decode("utf-8")
 
 
-def verify_password(plain: str, hashed: Optional[str]) -> bool:
+def verify_password(plain: str, hashed: str | None) -> bool:
     if not hashed:
         return False
     try:
@@ -44,23 +50,25 @@ def verify_password(plain: str, hashed: Optional[str]) -> bool:
 # ---- JWT ----
 def create_access_token(
     subject: str,
-    claims: Dict[str, Any],
-    expires_minutes: Optional[int] = None,
+    claims: dict[str, Any],
+    expires_minutes: int | None = None,
 ) -> str:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     exp = now + timedelta(minutes=expires_minutes or settings.jwt_access_ttl_minutes)
     payload = {
         "sub": subject,
         "iat": int(now.timestamp()),
         "exp": int(exp.timestamp()),
         "type": "access",
+        # jti：会话标识。审计日志 session_id、登出吊销（黑名单）都依赖它
+        "jti": secrets.token_urlsafe(16),
         **claims,
     }
     return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
 
 
 def create_refresh_token(subject: str) -> str:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     exp = now + timedelta(days=settings.jwt_refresh_ttl_days)
     payload = {
         "sub": subject,
@@ -72,7 +80,9 @@ def create_refresh_token(subject: str) -> str:
     return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
 
 
-def decode_token(token: str, expected_type: Literal["access", "refresh"] = "access") -> Dict[str, Any]:
+def decode_token(token: str, expected_type: Literal["access", "refresh"] = "access") -> dict[str, Any]:
+    from .error_codes import ErrorCode
+
     try:
         payload = jwt.decode(
             token,
@@ -80,12 +90,15 @@ def decode_token(token: str, expected_type: Literal["access", "refresh"] = "acce
             algorithms=[settings.jwt_algorithm],
         )
     except jwt.ExpiredSignatureError:
-        raise AuthError("Token 已过期，请重新登录")
+        raise AuthError("Token 已过期，请重新登录", error_code=ErrorCode.TOKEN_EXPIRED.value) from None
     except jwt.InvalidTokenError as e:
-        raise AuthError(f"Token 无效: {e}")
+        raise AuthError(f"Token 无效: {e}", error_code=ErrorCode.TOKEN_INVALID.value) from e
 
     if payload.get("type") != expected_type:
-        raise AuthError(f"Token 类型错误，期望 {expected_type}")
+        raise AuthError(
+            f"Token 类型错误，期望 {expected_type}",
+            error_code=ErrorCode.TOKEN_INVALID.value,
+        )
     return payload
 
 
@@ -93,7 +106,7 @@ def decode_token(token: str, expected_type: Literal["access", "refresh"] = "acce
 Role = Literal["admin", "investigator", "qa_reviewer", "ops_manager", "auditor", "operator"]
 
 # 权限矩阵：role → 允许的 action 列表
-ROLE_PERMISSIONS: Dict[str, set[str]] = {
+ROLE_PERMISSIONS: dict[str, set[str]] = {
     "admin": {
         "case:read", "case:write", "case:delete",
         "evidence:read", "evidence:write",
@@ -148,8 +161,10 @@ def require_permission(role: str, permission: str) -> None:
 
 
 # ---- 工具函数 ----
-def safe_compare(a: str, b: str) -> bool:
-    """恒定时间字符串比较 — 防止时序攻击"""
+def safe_compare(a: str | None, b: str | None) -> bool:
+    """恒定时间字符串比较 — 防止时序攻击（任一为 None/空时直接不等）"""
+    if not a or not b:
+        return False
     return hmac.compare_digest(a.encode(), b.encode())
 
 
@@ -158,3 +173,38 @@ def sha256_hex(data: str | bytes) -> str:
     if isinstance(data, str):
         data = data.encode("utf-8")
     return hashlib.sha256(data).hexdigest()
+
+
+# ---- Token 吊销（jti 黑名单）----
+# 依赖 Redis；Redis 不可用时降级为"不吊销"（与旧行为一致），避免服务不可用。
+# 21 CFR Part 11 要求会话可即时终止，生产环境必须配置 Redis。
+
+async def revoke_jti(jti: str, ttl_seconds: int) -> bool:
+    """将 jti 加入黑名单直至其自然过期。返回是否真正写入（False = 降级未生效）"""
+    if not jti:
+        return False
+    from .redis_client import get_redis
+
+    redis = await get_redis()
+    if redis is None:
+        return False
+    try:
+        await redis.setex(f"rca:jti_revoked:{jti}", ttl_seconds, "1")
+        return True
+    except Exception:
+        return False
+
+
+async def is_jti_revoked(jti: str) -> bool:
+    """检查 jti 是否已被吊销。Redis 不可用时返回 False（放行，与旧行为一致）"""
+    if not jti:
+        return False
+    from .redis_client import get_redis
+
+    redis = await get_redis()
+    if redis is None:
+        return False
+    try:
+        return bool(await redis.exists(f"rca:jti_revoked:{jti}"))
+    except Exception:
+        return False

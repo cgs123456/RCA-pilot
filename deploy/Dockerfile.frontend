@@ -1,20 +1,24 @@
-# RCA Pilot Frontend Dockerfile
+# RCA Pilot Frontend Dockerfile — 多阶段构建（Node 20 构建 + 非 root nginx 运行）
 FROM node:20-alpine AS builder
 
 WORKDIR /app
 
 COPY frontend/package.json frontend/package-lock.json* /app/
-RUN npm install --legacy-peer-deps
+# npm ci 保证可复现构建（依赖锁定文件必须存在）
+RUN npm ci --legacy-peer-deps
 
 COPY frontend /app
 RUN npm run build
 
-# ---- 运行阶段 ----
-FROM nginx:alpine
+# ---- 运行阶段（非 root 镜像，监听 8080）----
+FROM nginxinc/nginx-unprivileged:1.27-alpine
 
 COPY --from=builder /app/dist /usr/share/nginx/html
 COPY deploy/nginx.conf /etc/nginx/conf.d/default.conf
 
-EXPOSE 80
+EXPOSE 8080
+
+HEALTHCHECK --interval=15s --timeout=5s --retries=5 \
+  CMD wget -qO- http://localhost:8080/health || exit 1
 
 CMD ["nginx", "-g", "daemon off;"]

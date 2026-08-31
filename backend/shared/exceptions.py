@@ -1,11 +1,15 @@
 """统一异常体系 — GxP 场景下错误必须可追溯"""
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any
 
 
 class RCAError(Exception):
-    """RCA Pilot 业务异常基类"""
+    """RCA Pilot 业务异常基类
+
+    error_code：结构化错误码（error_codes.ErrorCode 的 value），
+    全局异常处理器优先读取它 —— 避免对文案做字符串匹配。
+    """
 
     status_code: int = 500
     code: str = "INTERNAL_ERROR"
@@ -14,14 +18,16 @@ class RCAError(Exception):
         self,
         message: str,
         *,
-        code: Optional[str] = None,
-        details: Optional[Dict[str, Any]] = None,
+        code: str | None = None,
+        details: dict[str, Any] | None = None,
+        error_code: str | None = None,
     ):
         super().__init__(message)
         self.message = message
         if code:
             self.code = code
         self.details = details or {}
+        self.error_code = error_code
 
 
 class ValidationError(RCAError):

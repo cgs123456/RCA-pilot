@@ -1,0 +1,57 @@
+# RCA Pilot — 本地开发覆盖文件
+# 与主 compose 叠加使用（把源码 bind-mount 进容器 + 暴露调试端口）：
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+#
+# 生产/CD 部署只用 docker-compose.yml（镜像即交付物，禁止 bind-mount 源码 —— GxP 版本可追溯）
+
+x-dev-backend: &dev-backend
+  volumes:
+    - ../backend:/app/backend
+  environment:
+    DEBUG: "true"
+
+services:
+  auth-service:
+    <<: *dev-backend
+    ports:
+      - "8001:8001"
+  case-service:
+    <<: *dev-backend
+    ports:
+      - "8002:8002"
+  evidence-service:
+    <<: *dev-backend
+    ports:
+      - "8003:8003"
+  agent-service:
+    <<: *dev-backend
+    ports:
+      - "8004:8004"
+  audit-service:
+    <<: *dev-backend
+    ports:
+      - "8005:8005"
+  lms-connector:
+    <<: *dev-backend
+    ports:
+      - "8011:8011"
+  bms-connector:
+    <<: *dev-backend
+    ports:
+      - "8012:8012"
+  ems-connector:
+    <<: *dev-backend
+    ports:
+      - "8013:8013"
+  mes-connector:
+    <<: *dev-backend
+    ports:
+      - "8014:8014"
+
+  # 本地开发需要直连数据库/Redis 时在此暴露（生产不暴露）
+  postgres:
+    ports:
+      - "5432:5432"
+  redis:
+    ports:
+      - "6379:6379"

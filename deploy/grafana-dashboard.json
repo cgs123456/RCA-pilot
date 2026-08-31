@@ -202,7 +202,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(rate(http_errors_total[1m])) by (service) / sum(rate(http_requests_total[1m])) by (service) * 100",
+          "expr": "sum(rate(http_errors_total[1m])) by (service) / clamp_min(sum(rate(http_requests_total[1m])) by (service), 0.001) * 100",
           "legendFormat": "{{service}}",
           "datasource": {
             "type": "prometheus",

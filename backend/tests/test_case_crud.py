@@ -11,7 +11,7 @@
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 
 import pytest
 from httpx import AsyncClient
@@ -19,7 +19,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.models import Deviation, User
 from shared.security import hash_password
-
 
 pytestmark = pytest.mark.asyncio
 
@@ -39,8 +38,8 @@ async def seeded_case(test_db: AsyncSession, seed_db):
         area="B 级区",
         investigator_id="U-LC",
         qa_reviewer_id="U-JW",
-        discovered_at=datetime.now(timezone.utc),
-        deadline=datetime.now(timezone.utc),
+        discovered_at=datetime.now(UTC),
+        deadline=datetime.now(UTC),
         organism="Micrococcus",
         progress=30,
         hitl_gates={
@@ -155,17 +154,17 @@ class TestCaseList:
 class TestCaseUpdate:
     """PATCH 更新 + 状态机校验（Critical #3）"""
 
-    async def test_update_progress_success(
+    async def test_update_progress_rejected(
         self, case_app_client: AsyncClient, auth_headers: dict, seeded_case
     ):
-        """调查员更新 progress 字段"""
+        """progress 由系统根据 HITL 关卡自动推进，PATCH 直接设置被拒绝"""
         resp = await case_app_client.patch(
             f"/api/v1/cases/{seeded_case.id}",
             json={"progress": 50},
             headers=auth_headers,
         )
-        assert resp.status_code == 200, resp.text
-        assert resp.json()["progress"] == 50
+        assert resp.status_code == 400, resp.text
+        assert "progress" in resp.json()["message"]
 
     async def test_update_immediate_action(
         self, case_app_client: AsyncClient, auth_headers: dict, seeded_case

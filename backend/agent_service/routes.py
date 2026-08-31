@@ -1,36 +1,43 @@
-"""Agent Service — 规则版编排引擎
+"""Agent Service — 6 Agent 流水线编排引擎
 
-Phase 1 实现：基于规则的状态机，无 LLM 调用。
-所有 Agent 输出基于案例已有证据数据 + 预设模板生成，
-每步输出计算 hash 并写入审计日志。
+运行时可靠性（GxP 关键）：
+- 每个阶段使用独立短事务落库（进度对外可见，pause/cancel 生效）
+- 进程重启后启动时扫描僵尸 run 标记 failed（main.py lifespan）
+- 异常路径用独立会话标记 failed + 补审计，run 不会永久卡在 pending
+- run_id 使用 uuid 后缀，同案例并发启动有 running 守卫 + 部分唯一索引兜底
+
+注意：本文件不使用 `from __future__ import annotations`（PEP 563）——
+slowapi 包装端点的字符串注解解析会落到 slowapi 模块命名空间导致 NameError。
 """
-from __future__ import annotations
-
 import asyncio
 import hashlib
 import json
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+import uuid
+from datetime import UTC, datetime
+from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, Query, Request
+from pydantic import BaseModel as PydBaseModel
+from pydantic import Field as PydField
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from shared.audit import append_audit_log
-from shared.auth_middleware import AuthContext, get_db_from_auth, require
-from shared.database import db_session
-from shared.exceptions import NotFoundError, ValidationError
-from shared.rate_limit import api_limit, write_limit
+from shared.auth_middleware import AuthContext, get_auth_context, get_db_from_auth, require
+from shared.config import settings
+from shared.database import db_session, get_db
+from shared.exceptions import ConflictError, NotFoundError, ValidationError
+from shared.metrics import AGENT_RUNS_TOTAL, AGENT_STAGE_DURATION
 from shared.models import (
     AgentRun,
     Deviation,
-    Evidence,
     FiveWhy,
     SkepticChallenge,
-    TimelineEvent,
 )
+from shared.rate_limit import api_limit, write_limit
 from shared.schemas import AgentRunCreate, AgentRunOut, Page
+from shared.security import safe_compare
 
 router = APIRouter(prefix="/agent", tags=["agent"])
 
@@ -53,6 +60,12 @@ AGENT_LABELS = {
     "guardian": "Guardian（合规终检）",
 }
 
+# 流水线中断状态 —— 处于这些状态的 run 不允许重复启动新流水线
+ACTIVE_RUN_STATUSES = ("pending", "running")
+
+# 僵尸 run 判定阈值：超过该时长仍处于 active 状态视为进程中断遗留
+ZOMBIE_RUN_THRESHOLD_MINUTES = 15
+
 
 def _hash_output(data: Any) -> str:
     """计算 Agent 输出的 hash（用于审计存证）"""
@@ -60,12 +73,30 @@ def _hash_output(data: Any) -> str:
     return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _filter_hallucinated_evidence(
+    evidence_ids: list[str], valid_ids: list[str]
+) -> tuple[list[str], list[str]]:
+    """过滤 LLM 输出中不存在的证据 ID（防幻觉直通审计链）
+
+    Returns:
+        (过滤后的证据 ID 列表, 被剔除的幻觉 ID 列表)
+    """
+    valid = set(valid_ids)
+    kept = [e for e in (evidence_ids or []) if e in valid]
+    dropped = [e for e in (evidence_ids or []) if e not in valid]
+    return kept, dropped
+
+
+def _case_evidence_ids(case: Deviation) -> list[str]:
+    return [ev.id for ev in (case.evidence or [])]
+
+
 # ============================================================
 #  Agent 实现（规则版）
 # ============================================================
 async def _run_evidence_hunter(
-    db: AsyncSession, case: Deviation
-) -> Dict[str, Any]:
+    db: AsyncSession, case: Deviation, flag_user: str | None = None
+) -> dict[str, Any]:
     """Evidence Hunter — 聚合案例已有证据 + 标注证据缺口 + 跨案例关联
 
     支持两种模式（通过 feature flag `evidence_hunter_semantic` 灰度切换）：
@@ -76,15 +107,16 @@ async def _run_evidence_hunter(
     LLM 失败时降级到关键词搜索，仍能返回 related_historical_cases（matched_by=keyword）。
     """
     from shared.feature_flag import is_enabled
-    use_semantic = is_enabled("evidence_hunter_semantic", user_id=case.investigator_id)
+    # 灰度按"触发者"而非案例负责人评估 —— 灰度归属与实际配置视角一致（可审计复现）
+    use_semantic = is_enabled("evidence_hunter_semantic", user_id=flag_user or case.investigator_id)
 
     evidence_list = case.evidence
-    by_source: Dict[str, int] = {}
+    by_source: dict[str, int] = {}
     for ev in evidence_list:
         by_source[ev.source_system] = by_source.get(ev.source_system, 0) + 1
 
     # 识别证据缺口（基于 6M 鱼骨图维度）
-    gaps: List[str] = []
+    gaps: list[str] = []
     if not any(ev.source_system == "LIMS" for ev in evidence_list):
         gaps.append("缺少 LIMS 检验数据（菌种鉴定）")
     if not any(ev.source_system == "LMS" for ev in evidence_list):
@@ -96,7 +128,7 @@ async def _run_evidence_hunter(
     anomalies = [ev for ev in evidence_list if ev.summary and ("超" in ev.summary or "异常" in ev.summary or "expired" in (ev.raw_data or {}).get("status", ""))]
 
     # 输出 payload（用于 hash 计算）— 不含 timestamp 等不稳定字段
-    output_payload: Dict[str, Any] = {
+    output_payload: dict[str, Any] = {
         "agent": "evidence_hunter",
         "status": "completed",
         "summary": f"收集 {len(evidence_list)} 条证据，覆盖 {len(by_source)} 个源系统",
@@ -115,8 +147,8 @@ async def _run_evidence_hunter(
         # 用案例标题 + 描述作为查询文本，搜索历史案例
         query_text = f"{case.title} {case.description or ''}".strip()
         try:
+            from shared.llm_client import LLMError, llm_client
             from shared.vector_store import find_related_cases as _find_related
-            from shared.llm_client import llm_client, LLMError
 
             query_embedding = None
             if llm_client.supports_embeddings:
@@ -144,17 +176,18 @@ async def _run_evidence_hunter(
         **output_payload,
         "ai_model": "rule-template-v1" if not use_semantic else f"semantic-{semantic_status}",
         "ai_output_hash": _hash_output(output_payload),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
     }
 
 
 async def _run_reasoner(
-    db: AsyncSession, case: Deviation, evidence_hunter_output: Dict[str, Any]
-) -> Dict[str, Any]:
+    db: AsyncSession, case: Deviation, evidence_hunter_output: dict[str, Any],
+    flag_user: str | None = None,
+) -> dict[str, Any]:
     """Reasoner — 5 Whys 推理 + 鱼骨图
 
     支持两种模式（通过 feature flag `reasoner_llm_enabled` 灰度切换）：
-    1. **规则版（默认兜底）**：基于案例已有 5 Whys 数据 + 预设鱼骨图模板
+    1. **规则版（默认兜底）**：基于案例已有 5 Whys 数据 + 数据驱动鱼骨图
     2. **LLM 版（灰度启用）**：调用 LLM Chain-of-Thought，从 Evidence + Timeline 做因果链推理
 
     LLM 路径需要 `reasoner_llm_enabled` flag 启用且 `LLMClient.is_configured` 为 True。
@@ -162,7 +195,7 @@ async def _run_reasoner(
     并在 ai_model 字段标记 fallback。
     """
     from shared.feature_flag import is_enabled
-    use_llm = is_enabled("reasoner_llm_enabled", user_id=case.investigator_id)
+    use_llm = is_enabled("reasoner_llm_enabled", user_id=flag_user or case.investigator_id)
 
     # 先生成规则版输出（作为兜底 + LLM 失败时的回退）
     rule_result = _build_rule_based_reasoner_output(case)
@@ -171,7 +204,7 @@ async def _run_reasoner(
 
     # LLM 灰度分支 —— flag 启用时调用 LLM
     try:
-        from shared.llm_client import llm_client, LLMError
+        from shared.llm_client import LLMError, llm_client
         if not llm_client.is_configured:
             # LLM 未配置 —— 降级到规则版（标记原因）
             rule_result["ai_model"] = "rule-template-v1 (llm-not-configured)"
@@ -193,16 +226,23 @@ async def _run_reasoner(
         return rule_result
 
 
-def _build_rule_based_reasoner_output(case: Deviation) -> Dict[str, Any]:
-    """规则版 Reasoner —— 基于案例已有 5 Whys + 预设鱼骨图模板"""
+def _build_rule_based_reasoner_output(case: Deviation) -> dict[str, Any]:
+    """规则版 Reasoner —— 数据驱动，仅汇总案例自身证据
+
+    禁止携带任何具体案例的事实性结论（历史教训：硬编码 demo 案例 EMP-2187 的
+    根因会随降级路径进入任何新案例的审计链）。规则版输出 = 结构化模板 +
+    案例实际证据引用，事实性结论必须由 LLM 路径或人工（HITL）给出。
+    """
     existing_whys = case.five_whys
+    valid_ids = _case_evidence_ids(case)
     whys_output = []
     for fw in existing_whys:
+        kept, dropped = _filter_hallucinated_evidence(fw.evidence_ids or [], valid_ids)
         whys_output.append({
             "n": fw.n,
             "question": fw.question,
             "answer": fw.answer,
-            "evidence_ids": fw.evidence_ids or [],
+            "evidence_ids": kept,
             "is_root_cause": fw.is_root_cause,
             "ai_model": "rule-template-v1",
             "ai_output_hash": _hash_output({
@@ -212,59 +252,59 @@ def _build_rule_based_reasoner_output(case: Deviation) -> Dict[str, Any]:
             }),
         })
 
-    # 鱼骨图 6M 分析（基于证据聚合）
+    # 鱼骨图 6M 分类 —— 从案例实际证据按源系统归类，无证据的维度明确标注"待调查"
+    by_source: dict[str, list[str]] = {}
+    for ev in case.evidence or []:
+        by_source.setdefault(ev.source_system, []).append(ev.id)
+
+    def _category(name: str, source_codes: list[str], hint: str) -> dict[str, Any]:
+        ev_ids: list[str] = []
+        for code in source_codes:
+            ev_ids.extend(by_source.get(code, []))
+        if ev_ids:
+            causes = [{
+                "text": f"关联 {code} 证据（具体原因需 LLM 推理或人工确认）",
+                "evidence": ev_ids,
+                "severity": "info",
+            } for code in source_codes if by_source.get(code)]
+        else:
+            causes = [{
+                "text": f"无 {hint} 相关证据 — 待调查",
+                "evidence": [],
+                "severity": "info",
+                "note": "无证据 — 推理假设",
+            }]
+        return {"name": name, "causes": causes}
+
     fishbone = {
         "root": case.title,
         "categories": [
-            {
-                "name": "人员 Man",
-                "causes": [
-                    {"text": "EMP-2187 更衣资质逾期", "evidence": ["E-LMS-01"], "severity": "danger"},
-                    {"text": "更衣合规性下降 (CCTV 佐证)", "evidence": ["E-CCTV-01", "E-CCTV-02", "E-CCTV-03", "E-CCTV-04"], "severity": "danger"},
-                ],
-            },
-            {
-                "name": "设备 Machine",
-                "causes": [
-                    {"text": "AHU-7 滤芯差压异常波动", "evidence": ["E-BMS-02", "E-BMS-05"], "severity": "warning"},
-                ],
-            },
-            {
-                "name": "物料 Material",
-                "causes": [
-                    {"text": "消毒剂 Spor-Klenz 批次 SK-2507-08", "evidence": ["E-MES-01", "E-MES-02"], "severity": "info"},
-                ],
-            },
-            {
-                "name": "方法 Method",
-                "causes": [
-                    {"text": "清洁 SOP 未涵盖资质门控", "evidence": ["E-SYS-01"], "severity": "warning"},
-                ],
-            },
-            {
-                "name": "环境 Environment",
-                "causes": [
-                    {"text": "B 级背景差压波动", "evidence": ["E-BMS-02"], "severity": "warning"},
-                ],
-            },
-            {
-                "name": "测量 Measurement",
-                "causes": [
-                    {"text": "沉降菌采样频率不足", "evidence": [], "severity": "info", "note": "无证据 — 推理假设"},
-                ],
-            },
+            _category("人员 Man", ["LMS"], "人员资质/培训"),
+            _category("设备 Machine", ["BMS"], "设备/HVAC"),
+            _category("物料 Material", ["MES"], "物料/批次"),
+            _category("方法 Method", ["SYS"], "方法/SOP"),
+            _category("环境 Environment", ["EMS"], "环境监测"),
+            _category("测量 Measurement", ["LIMS"], "检验/测量"),
         ],
     }
+
+    # 根因摘要：只陈述数据事实，不做事实性根因断言
+    top_evidence = [ev.id for ev in (case.evidence or [])[:5]]
+    root_cause_summary = (
+        f"规则版降级输出：未做事实性根因断言。案例 {case.id} 共有 {len(case.evidence or [])} 条证据"
+        f"（{', '.join(top_evidence) if top_evidence else '无'}），"
+        f"根因结论请启用 LLM 推理（reasoner_llm_enabled）或在 HITL gate2 人工确认。"
+    )
 
     return {
         "agent": "reasoner",
         "status": "completed",
         "five_whys": whys_output,
         "fishbone": fishbone,
-        "root_cause_summary": "根因：EMP-2187 更衣资质逾期 + LMS 与排班系统未集成导致无门控 + HVAC 差压异常叠加，共同导致 B 级背景微生物污染。",
+        "root_cause_summary": root_cause_summary,
         "ai_model": "rule-template-v1",
         "ai_output_hash": _hash_output(whys_output),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
     }
 
 
@@ -272,12 +312,11 @@ def _build_rule_based_reasoner_output(case: Deviation) -> Dict[str, Any]:
 #  Reasoner LLM 路径
 # ============================================================
 # Reasoner LLM 输出 schema —— 用于 Pydantic 校验 LLM 返回的 JSON
-from pydantic import BaseModel as PydBaseModel, Field as PydField
 
 
 class _LLMFiveWhy(PydBaseModel):
     """单条 5 Why"""
-    n: int = PydField(ge=1, le=10, description="Why 序号，从 1 开始")
+    n: int = PydField(ge=1, le=5, description="Why 序号，从 1 开始（5 Whys 最多 5 条）")
     question: str = PydField(min_length=1, description="Why 问题")
     answer: str = PydField(min_length=1, description="Why 答案")
     evidence_ids: list[str] = PydField(default_factory=list, description="证据 ID 列表，必须 ≥ 1 条")
@@ -336,7 +375,7 @@ _REASONER_SYSTEM_PROMPT = """你是药品 GMP 偏差调查员，专长根因分�
 
 
 def _build_reasoner_user_prompt(
-    case: Deviation, evidence_hunter_output: Dict[str, Any]
+    case: Deviation, evidence_hunter_output: dict[str, Any]
 ) -> str:
     """构造 Reasoner LLM user prompt —— 把案例 + 证据 + 时间线格式化为 LLM 输入"""
     # 证据列表（含 ID + 摘要 + 源系统）
@@ -380,9 +419,9 @@ Evidence Hunter 摘要：{eh_summary}
 
 async def _run_reasoner_with_llm(
     case: Deviation,
-    evidence_hunter_output: Dict[str, Any],
+    evidence_hunter_output: dict[str, Any],
     llm_client,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """LLM 版 Reasoner —— 调用 LLM 生成 5 Whys + 鱼骨图
 
     Args:
@@ -399,21 +438,27 @@ async def _run_reasoner_with_llm(
     # 计算 prompt hash（用于审计 ai_prompt_hash）
     prompt_hash = llm_client.hash_prompt(system, user_prompt)
 
-    # 调用 LLM（强制 JSON 输出 + Pydantic 校验）
+    # 调用 LLM（强制 JSON 输出 + Pydantic 校验；agent_label 用于 token 成本计量）
     llm_output: _LLMReasonerOutput = await llm_client.chat_json(
         system=system,
         user_prompt=user_prompt,
         schema=_LLMReasonerOutput,
+        agent_label="reasoner",
     )
 
-    # 转换为 Agent 输出格式（与规则版同构）
+    valid_ids = _case_evidence_ids(case)
+    hallucinated: list[str] = []
+
+    # 转换为 Agent 输出格式（与规则版同构；引用不存在的证据 ID 直接剔除——防幻觉入链）
     whys_output = []
     for fw in llm_output.five_whys:
+        kept, dropped = _filter_hallucinated_evidence(fw.evidence_ids, valid_ids)
+        hallucinated.extend(dropped)
         why_data = {
             "n": fw.n,
             "question": fw.question,
             "answer": fw.answer,
-            "evidence_ids": fw.evidence_ids,
+            "evidence_ids": kept,
             "is_root_cause": fw.is_root_cause,
         }
         whys_output.append({
@@ -422,7 +467,14 @@ async def _run_reasoner_with_llm(
             "ai_output_hash": _hash_output(why_data),
         })
 
+    # 鱼骨图证据引用同样过滤
     fishbone = llm_output.fishbone.model_dump()
+    for cat in fishbone.get("categories", []):
+        for cause in cat.get("causes", []):
+            kept, dropped = _filter_hallucinated_evidence(cause.get("evidence", []) or [], valid_ids)
+            hallucinated.extend(dropped)
+            cause["evidence"] = kept
+
     root_cause_summary = llm_output.root_cause_summary
 
     # 完整输出的 hash（用于审计 ai_output_hash）
@@ -432,7 +484,7 @@ async def _run_reasoner_with_llm(
         "root_cause_summary": root_cause_summary,
     }
 
-    return {
+    result = {
         "agent": "reasoner",
         "status": "completed",
         "five_whys": whys_output,
@@ -442,33 +494,38 @@ async def _run_reasoner_with_llm(
         "ai_prompt_hash": prompt_hash,
         "ai_output_hash": _hash_output(output_payload),
         "llm_enabled": True,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
     }
+    if hallucinated:
+        # 幻觉证据 ID 被剔除 —— 记录到输出供审计追溯（AgentHallucinationError 不阻塞流水线）
+        result["hallucination_filtered"] = sorted(set(hallucinated))
+    return result
 
 
 async def _run_skeptic(
-    db: AsyncSession, case: Deviation, reasoner_output: Dict[str, Any]
-) -> Dict[str, Any]:
+    db: AsyncSession, case: Deviation, reasoner_output: dict[str, Any],
+    flag_user: str | None = None,
+) -> dict[str, Any]:
     """Skeptic — 反例挑战
 
     支持两种模式（通过 feature flag `skeptic_v2_enhanced` 灰度切换）：
-    1. **规则版（默认兜底）**：硬编码 3-5 条挑战（v2 flag 启用时多 2 条）
+    1. **规则版（默认兜底）**：数据驱动的通用挑战（证据缺口/覆盖面检查）
     2. **LLM 版（灰度启用）**：根据当前案例的真实证据 + Reasoner 输出生成针对性反例挑战
 
     LLM 路径需要 `skeptic_v2_enhanced` flag 启用且 `LLMClient.is_configured` 为 True。
     LLM 失败时自动降级到规则版兜底，并在 ai_model 字段标记 fallback。
     """
     from shared.feature_flag import is_enabled
-    use_v2 = is_enabled("skeptic_v2_enhanced", user_id=case.investigator_id)
+    use_v2 = is_enabled("skeptic_v2_enhanced", user_id=flag_user or case.investigator_id)
 
     # 先生成规则版输出（作为兜底 + LLM 失败时的回退）
-    rule_result = _build_rule_based_skeptic_output(case, use_v2)
+    rule_result = _build_rule_based_skeptic_output(case, use_v2, reasoner_output)
     if not use_v2:
         return rule_result
 
     # LLM 灰度分支 —— flag 启用时调用 LLM
     try:
-        from shared.llm_client import llm_client, LLMError
+        from shared.llm_client import LLMError, llm_client
         if not llm_client.is_configured:
             rule_result["ai_model"] = "rule-template-v1 (llm-not-configured)"
             rule_result["llm_fallback_reason"] = "LLM provider/api_key 未配置，降级到规则版"
@@ -487,43 +544,74 @@ async def _run_skeptic(
         return rule_result
 
 
-def _build_rule_based_skeptic_output(case: Deviation, use_v2: bool) -> Dict[str, Any]:
-    """规则版 Skeptic —— 硬编码挑战列表"""
-    challenges = [
-        {
-            "target": "根因结论：EMP-2187 是污染源",
-            "challenge": "是否排除了其他当班人员引入污染的可能？CCTV 仅监控 EMP-2187，未覆盖其他人员更衣记录。",
-            "evidence_ids": ["E-CCTV-01", "E-CCTV-02", "E-CCTV-03", "E-CCTV-04"],
-            "type": "alternative_explanation",
-        },
-        {
-            "target": "根因结论：AHU-7 差压是次要因素",
-            "challenge": "AHU-7 更换滤芯后差压再次上升（E-BMS-05），可能 HVAC 本身存在独立故障，应独立调查。",
-            "evidence_ids": ["E-BMS-04", "E-BMS-05"],
-            "type": "independent_cause",
-        },
-        {
-            "target": "5 Whys #2：消毒剂有效",
-            "challenge": "未提供 Spor-Klenz RTU 批次 SK-2507-08 的有效性验证报告，应核实批次效力测试结果。",
-            "evidence_ids": ["E-MES-01", "E-MES-02"],
-            "type": "evidence_gap",
-        },
-    ]
+def _build_rule_based_skeptic_output(
+    case: Deviation, use_v2: bool, reasoner_output: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """规则版 Skeptic —— 数据驱动的通用挑战（不携带任何案例事实性结论）
 
-    # Skeptic v2 增强 —— 2 条额外挑战
+    挑战内容只基于案例证据覆盖面与 Reasoner 输出结构，指向"需要人工核实的缺口"，
+    具体事实性反例由 LLM 路径或人工给出。
+    """
+    reasoner_output = reasoner_output or {}
+    valid_ids = _case_evidence_ids(case)
+    root_summary = (case.title or case.id)
+    challenges: list[dict[str, Any]] = []
+
+    # 1. 替代解释维度：证据覆盖面是否足以排除其他解释
+    by_source: dict[str, int] = {}
+    for ev in case.evidence or []:
+        by_source[ev.source_system] = by_source.get(ev.source_system, 0) + 1
+    low_coverage = [s for s in ("LMS", "BMS", "EMS", "LIMS", "MES") if by_source.get(s, 0) < 2]
+    challenges.append({
+        "target": "根因结论（Reasoner 输出）",
+        "challenge": (
+            f"当前证据覆盖以下源系统：{by_source or '无'}。"
+            f"以下源系统证据不足 2 条：{low_coverage or '无'}。"
+            f"请确认是否已排除这些维度的替代解释。"
+        ),
+        "evidence_ids": [e for e in valid_ids if any(e.startswith(f"E-{s}") for s in low_coverage)][:3],
+        "type": "alternative_explanation",
+    })
+
+    # 2. 独立根因维度：是否对 Reasoner 引用的证据做了交叉验证
+    reasoner_ev_ids = [
+        e for w in (reasoner_output.get("five_whys") or []) for e in (w.get("evidence_ids") or [])
+    ]
+    challenges.append({
+        "target": "根因结论（Reasoner 输出）",
+        "challenge": (
+            "Reasoner 引用的证据是否被交叉验证？若同一现象存在多个独立来源的异常记录，"
+            "应排除独立根因叠加的可能。"
+        ),
+        "evidence_ids": list(dict.fromkeys(reasoner_ev_ids))[:3],
+        "type": "independent_cause",
+    })
+
+    # 3. 证据缺口维度：异常证据是否有对应的确证/复测记录
+    anomalies = [
+        ev.id for ev in (case.evidence or [])
+        if ev.summary and ("超" in ev.summary or "异常" in ev.summary or "expired" in json.dumps(ev.raw_data or {}, ensure_ascii=False))
+    ]
+    challenges.append({
+        "target": "证据链完整性",
+        "challenge": "以下证据被标记为异常，是否有对应的确证/复测/趋势分析记录？缺少确证属于证据缺口。",
+        "evidence_ids": anomalies[:4],
+        "type": "evidence_gap",
+    })
+
+    # Skeptic v2 增强 —— 追加时间相关性核查挑战
     if use_v2:
         challenges.append({
-            "target": "EMS 采样策略",
-            "challenge": "沉降菌采样为 4h/次，可能遗漏短时污染事件。建议核实是否需要增加主动采样（浮游菌）覆盖。",
-            "evidence_ids": ["E-EMS-01", "E-EMS-05"],
+            "target": "时间线相关性",
+            "challenge": "异常证据的时间窗是否与偏差发现时间重合？应做时间相关性分析排除巧合。目标案例：" + root_summary,
+            "evidence_ids": valid_ids[:3],
             "type": "evidence_gap",
         })
-        challenges.append({
-            "target": "根因结论：人员是主要污染源",
-            "challenge": "AHU-7 差压上升（8/12–8/14）与沉降菌计数上升（8/13–8/16）时间窗重合，应做相关性分析排除 HVAC 独立根因。",
-            "evidence_ids": ["E-BMS-02", "E-BMS-03", "E-EMS-02", "E-EMS-03"],
-            "type": "independent_cause",
-        })
+
+    # 过滤幻觉引用
+    for c in challenges:
+        kept, _ = _filter_hallucinated_evidence(c.get("evidence_ids") or [], valid_ids)
+        c["evidence_ids"] = kept
 
     return {
         "agent": "skeptic",
@@ -532,7 +620,7 @@ def _build_rule_based_skeptic_output(case: Deviation, use_v2: bool) -> Dict[str,
         "challenge_count": len(challenges),
         "ai_model": "rule-template-v1",
         "ai_output_hash": _hash_output(challenges),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
     }
 
 
@@ -587,7 +675,7 @@ _SKEPTIC_SYSTEM_PROMPT = """你是 GMP 偏差调查质量保证审核员，专�
 
 
 def _build_skeptic_user_prompt(
-    case: Deviation, reasoner_output: Dict[str, Any]
+    case: Deviation, reasoner_output: dict[str, Any]
 ) -> str:
     """构造 Skeptic LLM user prompt —— 把案例 + 证据 + Reasoner 输出格式化为 LLM 输入"""
     # 证据列表
@@ -636,9 +724,9 @@ Reasoner 输出（需要被挑战的结论）：
 
 async def _run_skeptic_with_llm(
     case: Deviation,
-    reasoner_output: Dict[str, Any],
+    reasoner_output: dict[str, Any],
     llm_client,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """LLM 版 Skeptic —— 调用 LLM 生成针对性反例挑战
 
     Args:
@@ -660,15 +748,21 @@ async def _run_skeptic_with_llm(
         system=system,
         user_prompt=user_prompt,
         schema=_LLMSkepticOutput,
+        agent_label="skeptic",
     )
 
-    # 转换为 Agent 输出格式（与规则版同构）
+    valid_ids = _case_evidence_ids(case)
+    hallucinated: list[str] = []
+
+    # 转换为 Agent 输出格式（与规则版同构；幻觉证据引用剔除）
     challenges_output = []
     for c in llm_output.challenges:
+        kept, dropped = _filter_hallucinated_evidence(c.evidence_ids, valid_ids)
+        hallucinated.extend(dropped)
         challenge_data = {
             "target": c.target,
             "challenge": c.challenge,
-            "evidence_ids": c.evidence_ids,
+            "evidence_ids": kept,
             "type": c.type,
         }
         challenges_output.append({
@@ -680,7 +774,7 @@ async def _run_skeptic_with_llm(
     # 完整输出的 hash（用于审计 ai_output_hash）
     output_payload = {"challenges": challenges_output}
 
-    return {
+    result = {
         "agent": "skeptic",
         "status": "completed",
         "challenges": challenges_output,
@@ -689,13 +783,17 @@ async def _run_skeptic_with_llm(
         "ai_prompt_hash": prompt_hash,
         "ai_output_hash": _hash_output(output_payload),
         "llm_enabled": True,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
     }
+    if hallucinated:
+        result["hallucination_filtered"] = sorted(set(hallucinated))
+    return result
 
 
 async def _run_drafter(
-    db: AsyncSession, case: Deviation, reasoner_output: Dict[str, Any], skeptic_output: Dict[str, Any]
-) -> Dict[str, Any]:
+    db: AsyncSession, case: Deviation, reasoner_output: dict[str, Any], skeptic_output: dict[str, Any],
+    flag_user: str | None = None,
+) -> dict[str, Any]:
     """Drafter — ICH Q9 报告生成
 
     支持两种模式（通过 feature flag `drafter_llm_enabled` 灰度切换）：
@@ -706,7 +804,7 @@ async def _run_drafter(
     LLM 失败时自动降级到规则版兜底。
     """
     from shared.feature_flag import is_enabled
-    use_llm = is_enabled("drafter_llm_enabled", user_id=case.investigator_id)
+    use_llm = is_enabled("drafter_llm_enabled", user_id=flag_user or case.investigator_id)
 
     # 先生成规则版输出（作为兜底）
     rule_result = _build_rule_based_drafter_output(case, reasoner_output, skeptic_output)
@@ -715,7 +813,7 @@ async def _run_drafter(
 
     # LLM 灰度分支
     try:
-        from shared.llm_client import llm_client, LLMError
+        from shared.llm_client import LLMError, llm_client
         if not llm_client.is_configured:
             rule_result["ai_model"] = "rule-template-v1 (llm-not-configured)"
             rule_result["llm_fallback_reason"] = "LLM provider/api_key 未配置，降级到模板版"
@@ -736,9 +834,9 @@ async def _run_drafter(
 
 def _build_rule_based_drafter_output(
     case: Deviation,
-    reasoner_output: Dict[str, Any],
-    skeptic_output: Dict[str, Any],
-) -> Dict[str, Any]:
+    reasoner_output: dict[str, Any],
+    skeptic_output: dict[str, Any],
+) -> dict[str, Any]:
     """规则版 Drafter — ICH Q9 模板拼接"""
     report = f"""偏差调查报告 — {case.id}
 
@@ -761,13 +859,12 @@ def _build_rule_based_drafter_output(
 8. Skeptic 反例审阅
 {chr(10).join([f"  - {c['challenge']}" for c in skeptic_output['challenges']])}
 
-9. CAPA 建议
-  - 立即：暂停 EMP-2187 B 级区作业，重新培训 + 更衣认证
-  - 短期：建立 LMS↔排班系统 资质门控 API 集成
-  - 长期：HVAC 系统独立调查（AHU-7 差压异常复发）
+9. CAPA 建议（数据驱动占位 —— 事实性 CAPA 由 LLM 路径或 HITL gate4 人工评审给出）
+{chr(10).join([f"  - [{ev.id}] ({ev.source_system}) 针对该证据的纠正措施待评审" for ev in (case.evidence or [])[:3]]) or "  - 待评审（无证据可引用）"}
 
 10. 合规声明
 本调查遵循 ICH Q9 质量风险管理原则，所有结论均有证据引用支持。
+本报告由规则版模板生成（LLM 未启用或降级），事实性根因与 CAPA 需经 HITL 人工确认后方可签发。
 """
     return {
         "agent": "drafter",
@@ -776,7 +873,7 @@ def _build_rule_based_drafter_output(
         "report_format": "ICH-Q9-template-v1",
         "ai_model": "rule-template-v1",
         "ai_output_hash": _hash_output(report),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
     }
 
 
@@ -812,8 +909,8 @@ ICH Q9 报告必须包含以下章节（按顺序）：
 
 def _build_drafter_user_prompt(
     case: Deviation,
-    reasoner_output: Dict[str, Any],
-    skeptic_output: Dict[str, Any],
+    reasoner_output: dict[str, Any],
+    skeptic_output: dict[str, Any],
 ) -> str:
     """构造 Drafter LLM user prompt —— 把案例 + Reasoner + Skeptic 输出格式化为 LLM 输入"""
     # 证据列表（用于报告引用）
@@ -885,10 +982,10 @@ Skeptic 反例挑战（{skeptic_output.get('challenge_count', 0)} 条）：
 
 async def _run_drafter_with_llm(
     case: Deviation,
-    reasoner_output: Dict[str, Any],
-    skeptic_output: Dict[str, Any],
+    reasoner_output: dict[str, Any],
+    skeptic_output: dict[str, Any],
     llm_client,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """LLM 版 Drafter —— 调用 LLM 生成 ICH Q9 Markdown 报告
 
     Args:
@@ -906,11 +1003,14 @@ async def _run_drafter_with_llm(
     # 计算 prompt hash（用于审计）
     prompt_hash = llm_client.hash_prompt(system, user_prompt)
 
-    # 调用 LLM（Drafter 输出 Markdown 文本，非 JSON，故用 chat_completion）
+    # 调用 LLM（Drafter 输出 Markdown 文本，非 JSON，故用 chat_completion；
+    # 整篇 ICH Q9 报告用独立的更大 max_tokens，避免全局 2048 截断）
     report_markdown = await llm_client.chat_completion(
         system=system,
         user_prompt=user_prompt,
         json_mode=False,
+        agent_label="drafter",
+        max_tokens=settings.llm_max_tokens_drafter,
     )
 
     # 清理输出（去除可能的首尾 ```markdown 代码块包裹）
@@ -931,7 +1031,7 @@ async def _run_drafter_with_llm(
         "ai_prompt_hash": prompt_hash,
         "ai_output_hash": _hash_output(report_markdown),
         "llm_enabled": True,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
     }
 
 
@@ -1011,7 +1111,7 @@ _META_CONTROLLER_SYSTEM_PROMPT = """你是 GMP 偏差调查的 Meta-Controller�
 }"""
 
 
-def _format_reasoner_for_prompt(label: str, r_out: Optional[Dict[str, Any]]) -> str:
+def _format_reasoner_for_prompt(label: str, r_out: dict[str, Any] | None) -> str:
     """格式化 Reasoner 输出为 LLM prompt 片段"""
     if r_out is None:
         return f"--- {label} ---\n(未生成)"
@@ -1029,9 +1129,9 @@ ai_output_hash: {r_out.get('ai_output_hash', '?')[:32]}..."""
 
 def _build_meta_controller_user_prompt(
     case: Deviation,
-    primary_output: Dict[str, Any],
-    adversary_output: Optional[Dict[str, Any]],
-    skeptic_output: Dict[str, Any],
+    primary_output: dict[str, Any],
+    adversary_output: dict[str, Any] | None,
+    skeptic_output: dict[str, Any],
 ) -> str:
     """构造 Meta-Controller LLM user prompt —— 注入两份 Reasoner + Skeptic 交叉质证"""
     evidence_lines = []
@@ -1071,11 +1171,11 @@ Skeptic 交叉质证：
 
 async def _run_meta_controller_synthesis_with_llm(
     case: Deviation,
-    primary_output: Dict[str, Any],
-    adversary_output: Optional[Dict[str, Any]],
-    skeptic_output: Dict[str, Any],
+    primary_output: dict[str, Any],
+    adversary_output: dict[str, Any] | None,
+    skeptic_output: dict[str, Any],
     llm_client,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Meta-Controller 综合置信度结论 —— LLM 调用
 
     Args:
@@ -1096,6 +1196,7 @@ async def _run_meta_controller_synthesis_with_llm(
         system=system,
         user_prompt=user_prompt,
         schema=_LLMMetaControllerOutput,
+        agent_label="meta_controller",
     )
 
     output_payload = {
@@ -1120,7 +1221,7 @@ async def _run_meta_controller_synthesis_with_llm(
         "ai_prompt_hash": prompt_hash,
         "ai_output_hash": _hash_output(output_payload),
         "llm_enabled": True,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
     }
 
 
@@ -1162,8 +1263,8 @@ _CROSS_EXAMINE_SYSTEM_PROMPT = """你是 GMP 偏差调查质量保证审核员�
 
 def _build_cross_examine_user_prompt(
     case: Deviation,
-    primary_output: Dict[str, Any],
-    adversary_output: Optional[Dict[str, Any]],
+    primary_output: dict[str, Any],
+    adversary_output: dict[str, Any] | None,
 ) -> str:
     """构造交叉质证 user prompt —— 注入两份 Reasoner 输出"""
     evidence_lines = []
@@ -1194,10 +1295,10 @@ def _build_cross_examine_user_prompt(
 
 async def _run_skeptic_cross_examine_with_llm(
     case: Deviation,
-    primary_output: Dict[str, Any],
-    adversary_output: Optional[Dict[str, Any]],
+    primary_output: dict[str, Any],
+    adversary_output: dict[str, Any] | None,
     llm_client,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """LLM 版交叉质证 Skeptic —— 接受两份 Reasoner 输出
 
     复用 _LLMSkepticOutput schema（type 字段为自由字符串，支持 contradiction / evidence_conflict）。
@@ -1210,14 +1311,20 @@ async def _run_skeptic_cross_examine_with_llm(
         system=system,
         user_prompt=user_prompt,
         schema=_LLMSkepticOutput,
+        agent_label="skeptic_cross_examine",
     )
+
+    valid_ids = _case_evidence_ids(case)
+    hallucinated: list[str] = []
 
     challenges_output = []
     for c in llm_output.challenges:
+        kept, dropped = _filter_hallucinated_evidence(c.evidence_ids, valid_ids)
+        hallucinated.extend(dropped)
         challenge_data = {
             "target": c.target,
             "challenge": c.challenge,
-            "evidence_ids": c.evidence_ids,
+            "evidence_ids": kept,
             "type": c.type,
         }
         challenges_output.append({
@@ -1228,7 +1335,7 @@ async def _run_skeptic_cross_examine_with_llm(
 
     output_payload = {"challenges": challenges_output}
 
-    return {
+    result = {
         "agent": "skeptic",
         "status": "completed",
         "challenges": challenges_output,
@@ -1238,8 +1345,11 @@ async def _run_skeptic_cross_examine_with_llm(
         "ai_prompt_hash": prompt_hash,
         "ai_output_hash": _hash_output(output_payload),
         "llm_enabled": True,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
     }
+    if hallucinated:
+        result["hallucination_filtered"] = sorted(set(hallucinated))
+    return result
 
 
 # ============================================================
@@ -1249,8 +1359,9 @@ async def _run_skeptic_cross_examine_with_llm(
 async def _run_reasoner_debate(
     db: AsyncSession,
     case: Deviation,
-    evidence_hunter_output: Dict[str, Any],
-) -> Dict[str, Any]:
+    evidence_hunter_output: dict[str, Any],
+    flag_user: str | None = None,
+) -> dict[str, Any]:
     """多 Agent 博弈 —— 并行启动 2 个 Reasoner（primary + adversary）
 
     primary 用主 LLM 客户端（settings.llm_*），adversary 用 debate LLM 客户端
@@ -1279,7 +1390,7 @@ async def _run_reasoner_debate(
             ...
         }
     """
-    from shared.llm_client import llm_client, LLMError, get_debate_client
+    from shared.llm_client import LLMError, get_debate_client, llm_client
 
     rule_result = _build_rule_based_reasoner_output(case)
 
@@ -1295,10 +1406,17 @@ async def _run_reasoner_debate(
             "debate_mode": "rule_fallback",
             "ai_model": "rule-template-v1",
             "ai_output_hash": rule_result["ai_output_hash"],
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
         }
 
     adversary_client = get_debate_client()
+
+    # 自博弈防护：adversary 与 primary 是同一个 (provider, model) 时，
+    # "博弈"退化为同模型重复采样，置信度会被虚高 —— 拒绝并降级 primary_only
+    same_model_rejected = False
+    if adversary_client is not None and adversary_client.identity == llm_client.identity:
+        same_model_rejected = True
+        adversary_client = None
 
     async def _safe_run(label: str, client):
         """安全执行 Reasoner LLM 调用，捕获异常返回 (result, error)"""
@@ -1349,20 +1467,24 @@ async def _run_reasoner_debate(
         "primary": primary_output,
         "adversary": adversary_output,
         "debate_mode": debate_mode,
-        "adversary_error": adversary_err if adversary_output is None and adversary_client is not None else None,
+        "adversary_error": (
+            adversary_err
+            if adversary_output is None and (adversary_client is not None or same_model_rejected)
+            else None
+        ) or ("adversary 与 primary 为同一 (provider, model)，拒绝自博弈，降级 primary_only" if same_model_rejected else None),
         "ai_model": primary_output.get("ai_model", "rule-template-v1"),
         "ai_output_hash": _hash_output(debate_payload),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
     }
 
 
 async def _run_drafter_debate(
     db: AsyncSession,
     case: Deviation,
-    debate_output: Dict[str, Any],
-    skeptic_output: Dict[str, Any],
-    meta_controller_output: Dict[str, Any],
-) -> Dict[str, Any]:
+    debate_output: dict[str, Any],
+    skeptic_output: dict[str, Any],
+    meta_controller_output: dict[str, Any],
+) -> dict[str, Any]:
     """博弈模式下的 Drafter —— 使用 Meta-Controller 综合结论生成 ICH Q9 报告
 
     构造一个合成 reasoner_output（用 Meta-Controller 的 final_root_cause_summary + primary 的 5 Whys），
@@ -1389,9 +1511,9 @@ async def _run_drafter_debate(
 async def _run_skeptic_cross_examine(
     db: AsyncSession,
     case: Deviation,
-    primary_output: Dict[str, Any],
-    adversary_output: Optional[Dict[str, Any]],
-) -> Dict[str, Any]:
+    primary_output: dict[str, Any],
+    adversary_output: dict[str, Any] | None,
+) -> dict[str, Any]:
     """交叉质证 Skeptic wrapper —— LLM 路径 + 三级降级
 
     1. flag `multi_agent_debate_enabled` 已启用 → 调用 LLM 交叉质证
@@ -1399,10 +1521,10 @@ async def _run_skeptic_cross_examine(
     3. LLM 异常 → 降级到规则版 Skeptic
     """
     # 用 primary 作为 reasoner_input 走规则版兜底
-    rule_result = _build_rule_based_skeptic_output(case, use_v2=True)
+    rule_result = _build_rule_based_skeptic_output(case, use_v2=True, reasoner_output=primary_output)
 
     try:
-        from shared.llm_client import llm_client, LLMError
+        from shared.llm_client import LLMError, llm_client
         if not llm_client.is_configured:
             rule_result["ai_model"] = "rule-template-v1 (llm-not-configured)"
             rule_result["llm_fallback_reason"] = "LLM provider/api_key 未配置，交叉质证降级到规则版"
@@ -1424,20 +1546,21 @@ async def _run_skeptic_cross_examine(
 async def _run_meta_controller_synthesis(
     db: AsyncSession,
     case: Deviation,
-    primary_output: Dict[str, Any],
-    adversary_output: Optional[Dict[str, Any]],
-    skeptic_output: Dict[str, Any],
-) -> Dict[str, Any]:
+    primary_output: dict[str, Any],
+    adversary_output: dict[str, Any] | None,
+    skeptic_output: dict[str, Any],
+) -> dict[str, Any]:
     """Meta-Controller 综合 wrapper —— LLM 路径 + 降级
 
     降级策略：LLM 不可用时，构造一个简单的综合结论（采用 primary 的根因结论，
     confidence_score=0.5 标记为缺乏交叉验证）。
     """
     fallback_summary = primary_output.get("root_cause_summary", "(primary 推理失败)")
+    # 缺乏交叉验证（无对抗方）时置信度硬封顶 0.7 —— 只有一个推理来源，不允许虚高
     fallback_payload = {
         "agreed_root_cause": fallback_summary if adversary_output is None else "",
         "final_root_cause_summary": fallback_summary,
-        "confidence_score": 0.5 if adversary_output is None else 0.3,
+        "confidence_score": 0.5,  # 无 LLM 综合 = 无交叉验证 = 固定中等偏低置信度
         "agreement_points": [],
         "disagreement_points": [],
         "recommended_actions": [],
@@ -1449,18 +1572,23 @@ async def _run_meta_controller_synthesis(
         "ai_model": "rule-template-v1 (llm-not-configured)",
         "ai_output_hash": _hash_output(fallback_payload),
         "llm_enabled": False,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
     }
 
     try:
-        from shared.llm_client import llm_client, LLMError
+        from shared.llm_client import LLMError, llm_client
         if not llm_client.is_configured:
             fallback_result["llm_fallback_reason"] = "LLM 未配置，Meta-Controller 降级到简单综合"
             return fallback_result
 
-        return await _run_meta_controller_synthesis_with_llm(
+        result = await _run_meta_controller_synthesis_with_llm(
             case, primary_output, adversary_output, skeptic_output, llm_client
         )
+        # 代码级硬约束（prompt 约束不可靠）：adversary 缺失时置信度封顶 0.7
+        if adversary_output is None:
+            result["confidence_score"] = min(float(result.get("confidence_score", 0.0)), 0.7)
+            result["confidence_clamped_reason"] = "primary_only 模式：缺乏对抗方交叉验证，置信度已封顶 0.7"
+        return result
     except LLMError as e:
         fallback_result["ai_model"] = "rule-template-v1 (llm-fallback)"
         fallback_result["llm_fallback_reason"] = f"LLM 调用失败降级: {type(e).__name__}: {str(e)[:200]}"
@@ -1472,19 +1600,53 @@ async def _run_meta_controller_synthesis(
 
 
 async def _run_guardian(
-    db: AsyncSession, case: Deviation, drafter_output: Dict[str, Any]
-) -> Dict[str, Any]:
-    """Guardian — ALCOA+ 9 项合规检查"""
+    db: AsyncSession, case: Deviation, drafter_output: dict[str, Any]
+) -> dict[str, Any]:
+    """Guardian — ALCOA+ 9 项合规检查（数据驱动，不再硬编码 demo 案例 warning）"""
+    from sqlalchemy import func as _func
+
+    # 用 COUNT 查询而非关系访问 —— 调用方未必 selectinload 了集合（避免 async 懒加载崩溃）
+    fw_count = (await db.execute(
+        select(_func.count()).select_from(FiveWhy).where(FiveWhy.case_id == case.id)
+    )).scalar_one()
+    sc_count = (await db.execute(
+        select(_func.count()).select_from(SkepticChallenge).where(SkepticChallenge.case_id == case.id)
+    )).scalar_one()
+
+    evidence = case.evidence or []
+    by_source = {ev.source_system for ev in evidence}
+
+    # 数据驱动检查项：基于案例实际证据状态判定，而非固定文本
     checks = [
-        {"principle": "Attributable (可归因)", "status": "pass", "detail": "所有操作均记录操作员 ID 和时间戳"},
-        {"principle": "Legible (清晰)", "status": "pass", "detail": "电子记录可读，无手写模糊"},
-        {"principle": "Contemporaneous (同期)", "status": "pass", "detail": "证据收集时间与事件发生时间一致"},
-        {"principle": "Original (原始)", "status": "pass", "detail": "证据直接来自源系统，未经二次转录"},
-        {"principle": "Accurate (准确)", "status": "warning", "detail": "LMS 告警日志缺失，数据完整性存在风险"},
-        {"principle": "Complete (完整)", "status": "pass", "detail": "5 Whys + 鱼骨图 + Skeptic 反例完整"},
-        {"principle": "Consistent (一致)", "status": "pass", "detail": "证据间无矛盾"},
-        {"principle": "Enduring (持久)", "status": "pass", "detail": "审计日志不可篡改，DB RULE 防护"},
-        {"principle": "Available (可用)", "status": "pass", "detail": "可导出 CSV/JSON 审计包供监管检查"},
+        {"principle": "Attributable (可归因)", "status": "pass",
+         "detail": f"流水线由 {case.investigator_id or 'system'} 触发，所有操作均记录操作员与时间戳"},
+        {"principle": "Legible (清晰)", "status": "pass",
+         "detail": "电子记录可读，结构化存储"},
+        {"principle": "Contemporaneous (同期)", "status": "pass",
+         "detail": f"证据采集时间范围：{min((ev.collected_at for ev in evidence), default=None)} ~ "
+                   f"{max((ev.collected_at for ev in evidence), default=None)}"},
+        {
+            "principle": "Original (原始)",
+            "status": "pass" if all(ev.content_hash for ev in evidence) else "fail",
+            "detail": "全部证据含 content_hash 且直接来自源系统" if evidence else "案例无证据 — 需先收集证据",
+        },
+        {
+            "principle": "Accurate (准确)",
+            "status": "pass" if len(by_source) >= 3 else "warning",
+            "detail": (
+                f"证据覆盖 {len(by_source)} 个源系统（{', '.join(sorted(by_source)) or '无'}）"
+                if len(by_source) >= 3
+                else f"证据仅覆盖 {len(by_source)} 个源系统（{', '.join(sorted(by_source)) or '无'}），数据完整性存在风险 — 建议补充证据"
+            ),
+        },
+        {"principle": "Complete (完整)", "status": "pass" if fw_count else "warning",
+         "detail": f"5 Whys {fw_count} 条 + Skeptic {sc_count} 条"},
+        {"principle": "Consistent (一致)", "status": "pass",
+         "detail": "证据间无已知矛盾（Skeptic 反例需在 HITL gate3 处置）"},
+        {"principle": "Enduring (持久)", "status": "pass",
+         "detail": "审计日志 hash 链 + DB 触发器防篡改（UPDATE/DELETE/TRUNCATE）"},
+        {"principle": "Available (可用)", "status": "pass",
+         "detail": "可导出 CSV/JSON 审计包供监管检查"},
     ]
     pass_count = sum(1 for c in checks if c["status"] == "pass")
     warning_count = sum(1 for c in checks if c["status"] == "warning")
@@ -1498,267 +1660,369 @@ async def _run_guardian(
         "overall_passed": fail_count == 0,
         "ai_model": "rule-engine-v1",
         "ai_output_hash": _hash_output(checks),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
     }
 
 
 # ============================================================
-#  流水线编排
+#  流水线编排 —— 每阶段独立短事务
+#
+#  设计（修复原实现的 4 个上线阻断问题）：
+#  1. 进度可见：每阶段 commit 一次，外部能实时读到 current_agent/agent_states
+#  2. pause/cancel 生效：每阶段开始前检查 run.status，paused/cancelled 即停
+#  3. 异常安全：阶段事务自身回滚；失败用独立会话标记 failed + 补审计
+#  4. 不再长期占用一个 DB 连接跑完全程（原实现单事务占连接数分钟）
 # ============================================================
-async def _execute_pipeline(
-    case_id: str,
-    run_id: str,
-    triggered_by: str,
-) -> None:
-    """后台执行 Agent 流水线 — 串行执行 6 个 Agent，每步写审计日志"""
-    async with db_session() as db:
-        # 加载完整案例
-        stmt = (
-            select(Deviation)
-            .options(
-                selectinload(Deviation.evidence),
-                selectinload(Deviation.timeline),
-                selectinload(Deviation.five_whys),
-                selectinload(Deviation.skeptic_challenges),
-            )
-            .where(Deviation.id == case_id)
-        )
-        case = (await db.execute(stmt)).scalar_one_or_none()
-        if not case:
-            return
 
+def _aware(dt: datetime | None) -> datetime | None:
+    """SQLite 会返回 naive datetime，统一补 UTC 时区以便比较"""
+    if dt is not None and dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC)
+    return dt
+
+
+async def _get_run_status(run_id: str) -> str | None:
+    async with db_session() as db:
+        row = (await db.execute(select(AgentRun.status).where(AgentRun.id == run_id))).first()
+        return row[0] if row else None
+
+
+async def _write_stage_result(
+    run_id: str,
+    *,
+    agent: str,
+    states_update: dict[str, Any],
+    audits: list[dict[str, Any]],
+    completed: bool = False,
+) -> None:
+    """在独立短事务内提交阶段输出 + 阶段审计（原子）"""
+    async with db_session() as db:
         run = (await db.execute(select(AgentRun).where(AgentRun.id == run_id))).scalar_one_or_none()
         if not run:
             return
+        states = dict(run.agent_states or {})
+        states.update(states_update)
+        run.agent_states = states
+        run.current_agent = agent
+        if completed:
+            run.status = "completed"
+            run.current_agent = None
+            run.completed_at = datetime.now(UTC)
+        for audit in audits:
+            await append_audit_log(db, **audit)
+        await db.flush()
 
-        agent_states = dict(run.agent_states or {})
-        run.status = "running"
-        run.started_at = datetime.now(timezone.utc)
 
-        try:
-            # 1. Meta-Controller — 初始化
+def _stage_audit(operator: str, target: str, detail: str, out: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "operator": operator,
+        "action": "AGENT_RUN",
+        "target": target,
+        "detail": detail,
+        "ai_model": out.get("ai_model", "rule-template-v1"),
+        "ai_prompt_hash": out.get("ai_prompt_hash"),
+        "ai_output_hash": out.get("ai_output_hash"),
+    }
+
+
+def _observe_stage(agent: str, out: dict[str, Any], seconds: float) -> None:
+    try:
+        mode = "rule" if "rule-template" in str(out.get("ai_model", "")) else "llm"
+        AGENT_STAGE_DURATION.labels(agent=agent, mode=mode).observe(seconds)
+    except Exception:
+        pass
+
+
+async def recover_zombie_runs() -> int:
+    """启动时僵尸恢复 —— 把中断遗留的 pending/running run 标记为 failed
+
+    GxP 要求失败尝试也必须留痕：进程重启后，BackgroundTasks 里的流水线已丢失，
+    若不恢复这些 run 会永远停在 running，用户无法区分"还在跑"和"已经死了"。
+    返回恢复的 run 数量。
+    """
+    from datetime import timedelta
+
+    threshold = datetime.now(UTC) - timedelta(minutes=ZOMBIE_RUN_THRESHOLD_MINUTES)
+    recovered = 0
+    async with db_session() as db:
+        runs = (await db.execute(
+            select(AgentRun).where(AgentRun.status.in_(ACTIVE_RUN_STATUSES))
+        )).scalars().all()
+        for run in runs:
+            ref = _aware(run.started_at) or _aware(run.created_at)
+            # 刚启动不久的 run 保守跳过（多实例部署时其他实例可能正在执行）
+            if ref and ref > threshold:
+                continue
+            run.status = "failed"
+            run.error_message = "服务重启导致流水线中断（启动时僵尸恢复自动标记）"
+            run.completed_at = datetime.now(UTC)
+            await append_audit_log(
+                db,
+                operator="system:startup-recovery",
+                action="AGENT_PIPELINE_FAILED",
+                target=f"{run.case_id}/run/{run.id}",
+                detail="服务重启导致流水线中断，启动时自动标记为 failed（GxP: 失败留痕）",
+                ai_model="rule-engine-v1",
+            )
+            recovered += 1
+    if recovered:
+        AGENT_RUNS_TOTAL.labels(status="failed").inc(recovered)
+    return recovered
+
+
+async def _execute_pipeline(case_id: str, run_id: str, triggered_by: str) -> None:
+    """后台执行 Agent 流水线 — 串行执行 6 个 Agent，每阶段独立事务提交"""
+    import time
+
+    try:
+        # ---- 启动事务：running + meta_controller 初始化 + flag 快照 ----
+        from shared.feature_flag import is_enabled as _is_flag_enabled
+
+        flag_names = (
+            "reasoner_llm_enabled", "skeptic_v2_enhanced", "drafter_llm_enabled",
+            "evidence_hunter_semantic", "multi_agent_debate_enabled",
+        )
+        # 灰度按触发者评估（而非案例负责人），并把快照写入 run 供审计复现
+        flags_snapshot = {f: _is_flag_enabled(f, user_id=triggered_by) for f in flag_names}
+        use_debate = flags_snapshot["multi_agent_debate_enabled"]
+
+        async with db_session() as db:
+            run = (await db.execute(select(AgentRun).where(AgentRun.id == run_id))).scalar_one_or_none()
+            if not run or run.status in ("cancelled", "completed", "failed"):
+                return
+            case_exists = (
+                await db.execute(select(func.count()).select_from(Deviation).where(Deviation.id == case_id))
+            ).scalar_one()
+            if not case_exists:
+                run.status = "failed"
+                run.error_message = f"案例 {case_id} 不存在"
+                run.completed_at = datetime.now(UTC)
+                await db.flush()
+                AGENT_RUNS_TOTAL.labels(status="failed").inc()
+                return
+            run.status = "running"
+            run.started_at = datetime.now(UTC)
             run.current_agent = "meta_controller"
-            agent_states["meta_controller"] = {
-                "status": "completed",
-                "summary": f"启动案例 {case_id} 的 Agent 流水线",
-                "pipeline": AGENT_PIPELINE,
+            run.agent_states = {
+                "meta_controller": {
+                    "status": "completed",
+                    "summary": f"启动案例 {case_id} 的 Agent 流水线（触发者 {triggered_by}）",
+                    "pipeline": AGENT_PIPELINE,
+                    "flags": flags_snapshot,
+                }
             }
             await db.flush()
 
-            # 2. Evidence Hunter
-            run.current_agent = "evidence_hunter"
-            await db.flush()
-            eh_out = await _run_evidence_hunter(db, case)
-            agent_states["evidence_hunter"] = eh_out
-            await append_audit_log(
-                db,
-                operator="Evidence Hunter (AI)",
-                action="AGENT_RUN",
-                target=f"{case_id}/evidence_hunter",
-                detail=eh_out["summary"],
-                ai_model="rule-template-v1",
-                ai_output_hash=eh_out["ai_output_hash"],
-            )
-            await db.flush()
+        # ---- Stage 1: Evidence Hunter ----
+        if await _get_run_status(run_id) != "running":
+            return
+        t0 = time.perf_counter()
+        async with db_session() as db:
+            case = (await db.execute(
+                select(Deviation)
+                .options(selectinload(Deviation.evidence), selectinload(Deviation.timeline))
+                .where(Deviation.id == case_id)
+            )).scalar_one_or_none()
+            eh_out = await _run_evidence_hunter(db, case, flag_user=triggered_by) if case else None
+        _observe_stage("evidence_hunter", eh_out or {}, time.perf_counter() - t0)
+        await _write_stage_result(
+            run_id, agent="evidence_hunter", states_update={"evidence_hunter": eh_out},
+            audits=[_stage_audit("Evidence Hunter (AI)", f"{case_id}/evidence_hunter", eh_out["summary"], eh_out)],
+        )
 
-            # 3. Reasoner（含多 Agent 博弈分支）
-            from shared.feature_flag import is_enabled as _is_flag_enabled
-            use_debate = _is_flag_enabled("multi_agent_debate_enabled", user_id=case.investigator_id)
+        # ---- Stage 2/3/4/5: Reasoner(或博弈) → Skeptic → Meta → Drafter ----
+        if await _get_run_status(run_id) != "running":
+            return
+        if use_debate:
+            # ===== 多 Agent 博弈路径 =====
+            t0 = time.perf_counter()
+            async with db_session() as db:
+                case = (await db.execute(
+                    select(Deviation)
+                    .options(selectinload(Deviation.evidence), selectinload(Deviation.timeline),
+                             selectinload(Deviation.five_whys))
+                    .where(Deviation.id == case_id)
+                )).scalar_one_or_none()
+                debate_out = await _run_reasoner_debate(db, case, eh_out, flag_user=triggered_by) if case else None
+            _observe_stage("reasoner_debate", debate_out or {}, time.perf_counter() - t0)
 
-            if use_debate:
-                # ===== 多 Agent 博弈路径（Phase 2 改进5）=====
-                run.current_agent = "reasoner_debate"
-                await db.flush()
-                debate_out = await _run_reasoner_debate(db, case, eh_out)
-                agent_states["reasoner_debate"] = debate_out
-
-                primary_out = debate_out.get("primary") or {}
-                adversary_out = debate_out.get("adversary")
-                debate_mode = debate_out.get("debate_mode", "unknown")
-
-                # 审计 primary Reasoner
-                await append_audit_log(
-                    db,
-                    operator="Reasoner (AI) - primary",
-                    action="AGENT_RUN",
-                    target=f"{case_id}/reasoner_debate/primary",
-                    detail=f"[debate={debate_mode}] {primary_out.get('root_cause_summary', '?')}",
-                    ai_model=primary_out.get("ai_model", "rule-template-v1"),
-                    ai_prompt_hash=primary_out.get("ai_prompt_hash"),
-                    ai_output_hash=primary_out.get("ai_output_hash"),
+            primary_out = (debate_out or {}).get("primary") or {}
+            adversary_out = (debate_out or {}).get("adversary")
+            debate_mode = (debate_out or {}).get("debate_mode", "unknown")
+            audits = [
+                _stage_audit(
+                    "Reasoner (AI) - primary", f"{case_id}/reasoner_debate/primary",
+                    f"[debate={debate_mode}] {primary_out.get('root_cause_summary', '?')}", primary_out,
                 )
-
-                # 审计 adversary Reasoner（若存在）
-                if adversary_out is not None:
-                    await append_audit_log(
-                        db,
-                        operator="Reasoner (AI) - adversary",
-                        action="AGENT_RUN",
-                        target=f"{case_id}/reasoner_debate/adversary",
-                        detail=f"[debate={debate_mode}] {adversary_out.get('root_cause_summary', '?')}",
-                        ai_model=adversary_out.get("ai_model", "rule-template-v1"),
-                        ai_prompt_hash=adversary_out.get("ai_prompt_hash"),
-                        ai_output_hash=adversary_out.get("ai_output_hash"),
-                    )
-                elif debate_out.get("adversary_error"):
-                    await append_audit_log(
-                        db,
-                        operator="Reasoner (AI) - adversary",
-                        action="AGENT_RUN_FALLBACK",
-                        target=f"{case_id}/reasoner_debate/adversary",
-                        detail=f"adversary 降级原因: {debate_out['adversary_error']}",
-                        ai_model="rule-template-v1 (llm-fallback)",
-                    )
-                await db.flush()
-
-                # 4. Skeptic 交叉质证（两份 Reasoner 输入）
-                run.current_agent = "skeptic_cross_examine"
-                await db.flush()
-                s_out = await _run_skeptic_cross_examine(db, case, primary_out, adversary_out)
-                agent_states["skeptic"] = s_out
-                await append_audit_log(
-                    db,
-                    operator="Skeptic (AI) - cross-examine",
-                    action="AGENT_RUN",
-                    target=f"{case_id}/skeptic_cross_examine",
-                    detail=f"[cross-examine] 生成 {s_out['challenge_count']} 条交叉质证挑战",
-                    ai_model=s_out.get("ai_model", "rule-template-v1"),
-                    ai_prompt_hash=s_out.get("ai_prompt_hash"),
-                    ai_output_hash=s_out["ai_output_hash"],
-                )
-                await db.flush()
-
-                # 5. Meta-Controller 综合置信度结论
-                run.current_agent = "meta_controller"
-                await db.flush()
-                mc_out = await _run_meta_controller_synthesis(
-                    db, case, primary_out, adversary_out, s_out
-                )
-                agent_states["meta_controller"] = mc_out
-                await append_audit_log(
-                    db,
-                    operator="Meta-Controller (AI) - synthesis",
-                    action="AGENT_RUN",
-                    target=f"{case_id}/meta_controller",
-                    detail=(
-                        f"[confidence={mc_out.get('confidence_score', 0):.2f}] "
-                        f"{mc_out.get('final_root_cause_summary', '?')[:200]}"
-                    ),
-                    ai_model=mc_out.get("ai_model", "rule-template-v1"),
-                    ai_prompt_hash=mc_out.get("ai_prompt_hash"),
-                    ai_output_hash=mc_out.get("ai_output_hash"),
-                )
-                await db.flush()
-
-                # 6. Drafter（使用 Meta-Controller 综合结论）
-                run.current_agent = "drafter"
-                await db.flush()
-                d_out = await _run_drafter_debate(db, case, debate_out, s_out, mc_out)
-                agent_states["drafter"] = d_out
-                await append_audit_log(
-                    db,
-                    operator="Drafter (AI)",
-                    action="AGENT_RUN",
-                    target=f"{case_id}/drafter",
-                    detail=f"生成 ICH Q9 报告 (format: {d_out.get('report_format', '?')}, hash: {d_out['ai_output_hash'][:32]}...)",
-                    ai_model=d_out.get("ai_model", "rule-template-v1"),
-                    ai_prompt_hash=d_out.get("ai_prompt_hash"),
-                    ai_output_hash=d_out["ai_output_hash"],
-                )
-                await db.flush()
-
-            else:
-                # ===== 单 Reasoner 原路径（默认）=====
-                # 3. Reasoner
-                run.current_agent = "reasoner"
-                await db.flush()
-                r_out = await _run_reasoner(db, case, eh_out)
-                agent_states["reasoner"] = r_out
-                await append_audit_log(
-                    db,
-                    operator="Reasoner (AI)",
-                    action="AGENT_RUN",
-                    target=f"{case_id}/reasoner",
-                    detail=r_out["root_cause_summary"],
-                    ai_model=r_out.get("ai_model", "rule-template-v1"),
-                    ai_prompt_hash=r_out.get("ai_prompt_hash"),
-                    ai_output_hash=r_out["ai_output_hash"],
-                )
-                await db.flush()
-
-                # 4. Skeptic
-                run.current_agent = "skeptic"
-                await db.flush()
-                s_out = await _run_skeptic(db, case, r_out)
-                agent_states["skeptic"] = s_out
-                await append_audit_log(
-                    db,
-                    operator="Skeptic (AI)",
-                    action="AGENT_RUN",
-                    target=f"{case_id}/skeptic",
-                    detail=f"生成 {s_out['challenge_count']} 条反例挑战",
-                    ai_model=s_out.get("ai_model", "rule-template-v1"),
-                    ai_prompt_hash=s_out.get("ai_prompt_hash"),
-                    ai_output_hash=s_out["ai_output_hash"],
-                )
-                await db.flush()
-
-                # 5. Drafter
-                run.current_agent = "drafter"
-                await db.flush()
-                d_out = await _run_drafter(db, case, r_out, s_out)
-                agent_states["drafter"] = d_out
-                await append_audit_log(
-                    db,
-                    operator="Drafter (AI)",
-                    action="AGENT_RUN",
-                    target=f"{case_id}/drafter",
-                    detail=f"生成 ICH Q9 报告 (format: {d_out.get('report_format', '?')}, hash: {d_out['ai_output_hash'][:32]}...)",
-                    ai_model=d_out.get("ai_model", "rule-template-v1"),
-                    ai_prompt_hash=d_out.get("ai_prompt_hash"),
-                    ai_output_hash=d_out["ai_output_hash"],
-                )
-                await db.flush()
-
-            # 7. Guardian（两条路径共同）
-            run.current_agent = "guardian"
-            await db.flush()
-            g_out = await _run_guardian(db, case, d_out)
-            agent_states["guardian"] = g_out
-            await append_audit_log(
-                db,
-                operator="Guardian (AI)",
-                action="AGENT_RUN",
-                target=f"{case_id}/guardian",
-                detail=g_out["summary"],
-                ai_model="rule-engine-v1",
-                ai_output_hash=g_out["ai_output_hash"],
+            ]
+            if adversary_out is not None:
+                audits.append(_stage_audit(
+                    "Reasoner (AI) - adversary", f"{case_id}/reasoner_debate/adversary",
+                    f"[debate={debate_mode}] {adversary_out.get('root_cause_summary', '?')}", adversary_out,
+                ))
+            elif (debate_out or {}).get("adversary_error"):
+                audits.append({
+                    "operator": "Reasoner (AI) - adversary",
+                    "action": "AGENT_RUN_FALLBACK",
+                    "target": f"{case_id}/reasoner_debate/adversary",
+                    "detail": f"adversary 降级原因: {debate_out['adversary_error']}",
+                    "ai_model": "rule-template-v1 (llm-fallback)",
+                })
+            await _write_stage_result(
+                run_id, agent="reasoner_debate", states_update={"reasoner_debate": debate_out}, audits=audits
             )
 
-            run.agent_states = agent_states
-            run.status = "completed"
-            run.current_agent = None
-            run.completed_at = datetime.now(timezone.utc)
-            await db.flush()
+            # Skeptic 交叉质证
+            if await _get_run_status(run_id) != "running":
+                return
+            t0 = time.perf_counter()
+            async with db_session() as db:
+                case = (await db.execute(
+                    select(Deviation).options(selectinload(Deviation.evidence)).where(Deviation.id == case_id)
+                )).scalar_one_or_none()
+                s_out = (
+                    await _run_skeptic_cross_examine(db, case, primary_out, adversary_out)
+                    if case else None
+                )
+            _observe_stage("skeptic", s_out or {}, time.perf_counter() - t0)
+            await _write_stage_result(
+                run_id, agent="skeptic_cross_examine", states_update={"skeptic": s_out},
+                audits=[_stage_audit(
+                    "Skeptic (AI) - cross-examine", f"{case_id}/skeptic_cross_examine",
+                    f"[cross-examine] 生成 {s_out['challenge_count']} 条交叉质证挑战", s_out,
+                )],
+            )
 
-        except Exception as e:
-            # GxP 要求：失败的尝试也必须有审计记录。
-            # 主事务即将回滚，需用独立 session 写入失败审计日志。
-            run.status = "failed"
-            run.agent_states = {**agent_states, "error": str(e)}
-            await db.flush()
-            try:
-                await db.commit()  # 先尝试提交 run 状态变更
-            except Exception:
-                await db.rollback()
-                # run 状态变更回滚后，仍需独立写入失败审计日志
-                pass
+            # Meta-Controller 综合
+            if await _get_run_status(run_id) != "running":
+                return
+            t0 = time.perf_counter()
+            async with db_session() as db:
+                case = (await db.execute(
+                    select(Deviation).options(selectinload(Deviation.evidence)).where(Deviation.id == case_id)
+                )).scalar_one_or_none()
+                mc_out = (
+                    await _run_meta_controller_synthesis(db, case, primary_out, adversary_out, s_out)
+                    if case else None
+                )
+            _observe_stage("meta_controller", mc_out or {}, time.perf_counter() - t0)
+            await _write_stage_result(
+                run_id, agent="meta_controller", states_update={"meta_controller": mc_out},
+                audits=[_stage_audit(
+                    "Meta-Controller (AI) - synthesis", f"{case_id}/meta_controller",
+                    f"[confidence={mc_out.get('confidence_score', 0):.2f}] "
+                    f"{mc_out.get('final_root_cause_summary', '?')[:200]}",
+                    mc_out,
+                )],
+            )
 
-            # 独立事务写失败审计日志（不依赖主事务）
-            try:
-                async with db_session() as audit_db:
+            # Drafter（使用 Meta-Controller 综合结论）
+            if await _get_run_status(run_id) != "running":
+                return
+            t0 = time.perf_counter()
+            async with db_session() as db:
+                case = (await db.execute(
+                    select(Deviation).options(selectinload(Deviation.evidence)).where(Deviation.id == case_id)
+                )).scalar_one_or_none()
+                d_out = (
+                    await _run_drafter_debate(db, case, debate_out, s_out, mc_out)
+                    if case else None
+                )
+            _observe_stage("drafter", d_out or {}, time.perf_counter() - t0)
+            await _write_stage_result(
+                run_id, agent="drafter", states_update={"drafter": d_out},
+                audits=[_stage_audit(
+                    "Drafter (AI)", f"{case_id}/drafter",
+                    f"生成 ICH Q9 报告 (format: {d_out.get('report_format', '?')}, hash: {d_out['ai_output_hash'][:32]}...)",
+                    d_out,
+                )],
+            )
+        else:
+            # ===== 单 Reasoner 原路径（默认）=====
+            t0 = time.perf_counter()
+            async with db_session() as db:
+                case = (await db.execute(
+                    select(Deviation)
+                    .options(selectinload(Deviation.evidence), selectinload(Deviation.timeline),
+                             selectinload(Deviation.five_whys))
+                    .where(Deviation.id == case_id)
+                )).scalar_one_or_none()
+                r_out = await _run_reasoner(db, case, eh_out, flag_user=triggered_by) if case else None
+            _observe_stage("reasoner", r_out or {}, time.perf_counter() - t0)
+            await _write_stage_result(
+                run_id, agent="reasoner", states_update={"reasoner": r_out},
+                audits=[_stage_audit(
+                    "Reasoner (AI)", f"{case_id}/reasoner", r_out["root_cause_summary"], r_out,
+                )],
+            )
+
+            if await _get_run_status(run_id) != "running":
+                return
+            t0 = time.perf_counter()
+            async with db_session() as db:
+                case = (await db.execute(
+                    select(Deviation).options(selectinload(Deviation.evidence)).where(Deviation.id == case_id)
+                )).scalar_one_or_none()
+                s_out = await _run_skeptic(db, case, r_out, flag_user=triggered_by) if case else None
+            _observe_stage("skeptic", s_out or {}, time.perf_counter() - t0)
+            await _write_stage_result(
+                run_id, agent="skeptic", states_update={"skeptic": s_out},
+                audits=[_stage_audit(
+                    "Skeptic (AI)", f"{case_id}/skeptic",
+                    f"生成 {s_out['challenge_count']} 条反例挑战", s_out,
+                )],
+            )
+
+            if await _get_run_status(run_id) != "running":
+                return
+            t0 = time.perf_counter()
+            async with db_session() as db:
+                case = (await db.execute(
+                    select(Deviation).options(selectinload(Deviation.evidence)).where(Deviation.id == case_id)
+                )).scalar_one_or_none()
+                d_out = await _run_drafter(db, case, r_out, s_out, flag_user=triggered_by) if case else None
+            _observe_stage("drafter", d_out or {}, time.perf_counter() - t0)
+            await _write_stage_result(
+                run_id, agent="drafter", states_update={"drafter": d_out},
+                audits=[_stage_audit(
+                    "Drafter (AI)", f"{case_id}/drafter",
+                    f"生成 ICH Q9 报告 (format: {d_out.get('report_format', '?')}, hash: {d_out['ai_output_hash'][:32]}...)",
+                    d_out,
+                )],
+            )
+
+        # ---- Stage 6: Guardian ----
+        if await _get_run_status(run_id) != "running":
+            return
+        t0 = time.perf_counter()
+        async with db_session() as db:
+            case = (await db.execute(
+                select(Deviation)
+                .options(selectinload(Deviation.evidence), selectinload(Deviation.five_whys),
+                         selectinload(Deviation.skeptic_challenges))
+                .where(Deviation.id == case_id)
+            )).scalar_one_or_none()
+            g_out = await _run_guardian(db, case, d_out) if case else None
+        _observe_stage("guardian", g_out or {}, time.perf_counter() - t0)
+        await _write_stage_result(
+            run_id, agent="guardian", states_update={"guardian": g_out},
+            audits=[_stage_audit("Guardian (AI)", f"{case_id}/guardian", g_out["summary"], g_out)],
+            completed=True,
+        )
+        AGENT_RUNS_TOTAL.labels(status="completed").inc()
+
+    except Exception as e:
+        # 失败路径：用独立会话标记 failed + 补审计（GxP: 失败必须留痕，run 不得永久卡在 running）
+        AGENT_RUNS_TOTAL.labels(status="failed").inc()
+        try:
+            async with db_session() as db:
+                run = (await db.execute(select(AgentRun).where(AgentRun.id == run_id))).scalar_one_or_none()
+                if run and run.status not in ("completed", "cancelled"):
+                    run.status = "failed"
+                    run.error_message = f"{type(e).__name__}: {str(e)[:500]}"
+                    run.completed_at = datetime.now(UTC)
                     await append_audit_log(
-                        audit_db,
+                        db,
                         operator="Meta-Controller (AI)",
                         action="AGENT_PIPELINE_FAILED",
                         target=f"{case_id}/run/{run_id}",
@@ -1768,14 +2032,12 @@ async def _execute_pipeline(
                             "run_id": run_id,
                             "case_id": case_id,
                             "error": str(e),
-                            "failed_at": datetime.now(timezone.utc).isoformat(),
+                            "failed_at": datetime.now(UTC).isoformat(),
                         }),
                     )
-                    await audit_db.commit()
-            except Exception:
-                # 审计日志写入也失败 —— 只能记录到 stderr
-                import sys
-                print(f"[AGENT] CRITICAL: 审计日志写入失败 run_id={run_id}", file=sys.stderr)
+        except Exception:
+            import sys
+            print(f"[AGENT] CRITICAL: 失败状态标记/审计写入失败 run_id={run_id}", file=sys.stderr)
 
 
 # ============================================================
@@ -1787,20 +2049,47 @@ async def start_pipeline(
     request: Request,
     body: AgentRunCreate,
     background_tasks: BackgroundTasks,
-    db: AsyncSession = Depends(get_db_from_auth),
-    auth: AuthContext = Depends(require("agent:run")),
+    db: AsyncSession = Depends(get_db),
+    authorization: str | None = Header(default=None),
 ) -> AgentRunOut:
-    """启动案例的 Agent 流水线 — 后台异步执行"""
+    """启动案例的 Agent 流水线 — 后台异步执行
+
+    - 用户调用：Bearer JWT + agent:run 权限，triggered_by 强制取当前用户（审计归因不可伪造）
+    - 服务间调用：X-Service-Key 头（gate3 自动重试等内部触发），triggered_by 由调用方声明
+    - 幂等防护：同案例已有 pending/running 的 run 时返回 409
+    """
+    service_key = request.headers.get("X-Service-Key", "")
+    if settings.service_api_key and service_key and safe_compare(service_key, settings.service_api_key):
+        actor = body.triggered_by or "system"
+    else:
+        auth = await get_auth_context(request=request, authorization=authorization, db=db)
+        auth.check("agent:run")
+        actor = auth.email  # 忽略客户端传入的 triggered_by —— 审计归因不可由客户端指定
+
     case = (await db.execute(select(Deviation).where(Deviation.id == body.case_id))).scalar_one_or_none()
     if not case:
         raise NotFoundError(f"案例 {body.case_id} 不存在")
 
-    run_id = f"RUN-{body.case_id}-{int(datetime.now(timezone.utc).timestamp())}"
+    # 重复触发防护：同案例同时只允许一条活跃流水线
+    existing = (
+        await db.execute(
+            select(AgentRun)
+            .where(AgentRun.case_id == body.case_id, AgentRun.status.in_(ACTIVE_RUN_STATUSES))
+        )
+    ).scalars().first()
+    if existing:
+        raise ConflictError(
+            f"案例 {body.case_id} 已有进行中的流水线 {existing.id}（status={existing.status}），"
+            f"请等待完成、暂停或取消后再启动"
+        )
+
+    # run_id 用 uuid 后缀 —— 旧版秒级时间戳同秒并发会主键冲突
+    run_id = f"RUN-{body.case_id}-{uuid.uuid4().hex[:8]}"
     run = AgentRun(
         id=run_id,
         case_id=body.case_id,
         status="pending",
-        triggered_by=body.triggered_by or auth.email,
+        triggered_by=actor,
         agent_states={},
     )
     db.add(run)
@@ -1808,16 +2097,15 @@ async def start_pipeline(
 
     await append_audit_log(
         db,
-        operator=auth.email,
+        operator=actor,
         action="AGENT_PIPELINE_START",
         target=body.case_id,
-        detail=f"启动 Agent 流水线 (run_id={run_id})",
-        ip_address=auth.ip_address,
-        session_id=auth.session_id,
+        detail=f"启动 Agent 流水线 (run_id={run_id}, flags 快照见 run.agent_states.meta_controller)",
+        ip_address=request.client.host if request.client else "unknown",
     )
 
     # 后台执行
-    background_tasks.add_task(_execute_pipeline, body.case_id, run_id, auth.email)
+    background_tasks.add_task(_execute_pipeline, body.case_id, run_id, actor)
 
     return AgentRunOut.model_validate(run)
 
@@ -1828,9 +2116,9 @@ async def get_run(
     request: Request,
     run_id: str,
     db: AsyncSession = Depends(get_db_from_auth),
-    _: AuthContext = Depends(require("agent:run")),
+    _: AuthContext = Depends(require("case:read")),
 ) -> AgentRunOut:
-    """查询 Agent 流水线运行状态 + 各 Agent 输出"""
+    """查询 Agent 流水线运行状态 + 各 Agent 输出（读权限：case:read，QA 亦可查看调查进度）"""
     run = (await db.execute(select(AgentRun).where(AgentRun.id == run_id))).scalar_one_or_none()
     if not run:
         raise NotFoundError(f"Agent 运行 {run_id} 不存在")
@@ -1841,12 +2129,12 @@ async def get_run(
 @api_limit
 async def list_runs(
     request: Request,
-    case_id: Optional[str] = Query(default=None),
-    status: Optional[str] = Query(default=None),
+    case_id: str | None = Query(default=None),
+    status: str | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
     db: AsyncSession = Depends(get_db_from_auth),
-    _: AuthContext = Depends(require("agent:run")),
+    _: AuthContext = Depends(require("case:read")),
 ) -> Page[AgentRunOut]:
     """查询 Agent 运行历史"""
     stmt = select(AgentRun)
@@ -1873,6 +2161,15 @@ async def list_runs(
     )
 
 
+async def _load_run_for_control(db: AsyncSession, run_id: str) -> AgentRun:
+    run = (
+        await db.execute(select(AgentRun).where(AgentRun.id == run_id).with_for_update())
+    ).scalar_one_or_none()
+    if not run:
+        raise NotFoundError(f"Agent 运行 {run_id} 不存在")
+    return run
+
+
 @router.post("/runs/{run_id}/pause", summary="暂停 Agent 运行 (HITL)")
 @write_limit
 async def pause_run(
@@ -1881,12 +2178,17 @@ async def pause_run(
     db: AsyncSession = Depends(get_db_from_auth),
     auth: AuthContext = Depends(require("agent:pause")),
 ) -> dict:
-    """暂停 Agent 流水线 — 等待 HITL 人工决策"""
-    run = (await db.execute(select(AgentRun).where(AgentRun.id == run_id))).scalar_one_or_none()
-    if not run:
-        raise NotFoundError(f"Agent 运行 {run_id} 不存在")
+    """暂停 Agent 流水线
+
+    每阶段开始前流水线会检查 run.status，置为 paused 后当前阶段执行完即停。
+    恢复用 /resume。
+    """
+    run = await _load_run_for_control(db, run_id)
     if run.status != "running":
-        raise ValidationError("仅运行中的 Agent 可暂停")
+        raise ValidationError(
+            f"仅运行中的 Agent 可暂停（当前 status={run.status}）",
+            error_code=None,
+        )
     run.status = "paused"
     await append_audit_log(
         db,
@@ -1898,3 +2200,68 @@ async def pause_run(
         session_id=auth.session_id,
     )
     return {"status": "paused", "run_id": run_id, "current_agent": run.current_agent}
+
+
+@router.post("/runs/{run_id}/cancel", summary="取消 Agent 运行")
+@write_limit
+async def cancel_run(
+    request: Request,
+    run_id: str,
+    db: AsyncSession = Depends(get_db_from_auth),
+    auth: AuthContext = Depends(require("agent:pause")),
+) -> dict:
+    """取消运行中的/暂停中的流水线 —— 终态，不可恢复（需重新启动新流水线）"""
+    run = await _load_run_for_control(db, run_id)
+    if run.status not in ("pending", "running", "paused"):
+        raise ValidationError(
+            f"仅 pending/running/paused 状态可取消（当前 status={run.status}）",
+            error_code=None,
+        )
+    run.status = "cancelled"
+    run.completed_at = datetime.now(UTC)
+    run.error_message = f"由 {auth.email} 手动取消"
+    await append_audit_log(
+        db,
+        operator=auth.email,
+        action="AGENT_CANCEL",
+        target=run_id,
+        detail=f"取消于 {run.current_agent}",
+        ip_address=auth.ip_address,
+        session_id=auth.session_id,
+    )
+    AGENT_RUNS_TOTAL.labels(status="cancelled").inc()
+    return {"status": "cancelled", "run_id": run_id}
+
+
+@router.post("/runs/{run_id}/resume", summary="恢复暂停的 Agent 运行")
+@write_limit
+async def resume_run(
+    request: Request,
+    run_id: str,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db_from_auth),
+    auth: AuthContext = Depends(require("agent:run")),
+) -> dict:
+    """恢复暂停的流水线
+
+    实现：置回 running 并重新启动流水线执行 —— 已完成的阶段输出会被重新执行覆盖
+    （流水线各阶段均为确定性/可重入计算，报告以最终一次输出为准，全过程留审计）。
+    """
+    run = await _load_run_for_control(db, run_id)
+    if run.status != "paused":
+        raise ValidationError(
+            f"仅 paused 状态可恢复（当前 status={run.status}）",
+            error_code=None,
+        )
+    run.status = "running"
+    await append_audit_log(
+        db,
+        operator=auth.email,
+        action="AGENT_RESUME",
+        target=run_id,
+        detail="恢复运行（流水线将重新执行各阶段，已完成阶段输出会被覆盖）",
+        ip_address=auth.ip_address,
+        session_id=auth.session_id,
+    )
+    background_tasks.add_task(_execute_pipeline, run.case_id, run_id, run.triggered_by)
+    return {"status": "running", "run_id": run_id}

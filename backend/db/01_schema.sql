@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash   VARCHAR(200),  -- 内置登录（生产对接 OIDC）
     is_active       BOOLEAN NOT NULL DEFAULT TRUE,
     failed_login_attempts INTEGER NOT NULL DEFAULT 0,
+    locked_until   TIMESTAMPTZ,
     last_login_at   TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -75,6 +76,7 @@ CREATE TABLE IF NOT EXISTS deviations (
     product_impact  TEXT,
     immediate_action TEXT,
     progress        INTEGER NOT NULL DEFAULT 0 CHECK (progress BETWEEN 0 AND 100),
+    closed_at       TIMESTAMPTZ,
     hitl_gates      JSONB NOT NULL DEFAULT '{}'::jsonb,
     meta            JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -97,6 +99,9 @@ CREATE TABLE IF NOT EXISTS evidence (
     content_hash    VARCHAR(80) NOT NULL,
     confidence      SMALLINT NOT NULL DEFAULT 3 CHECK (confidence BETWEEN 1 AND 4),
     is_signed       BOOLEAN NOT NULL DEFAULT FALSE,
+    embedding       JSONB,
+    embedding_model VARCHAR(80),
+    embedded_at     TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS ix_evidence_source_case ON evidence(source_system, case_id);
@@ -140,6 +145,7 @@ CREATE TABLE IF NOT EXISTS five_whys (
     UNIQUE(case_id, n)
 );
 CREATE INDEX IF NOT EXISTS ix_fivewhys_case ON five_whys(case_id);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_five_whys_case_n ON five_whys(case_id, n);
 
 -- ============================================================
 --  Skeptic 反例挑战
@@ -168,6 +174,7 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     started_at      TIMESTAMPTZ,
     completed_at    TIMESTAMPTZ,
     agent_states    JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error_message   TEXT,
     triggered_by    VARCHAR(100) NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -190,6 +197,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
     ai_model        VARCHAR(100),
     ai_prompt_hash  VARCHAR(80),
     ai_output_hash  VARCHAR(80),
+    trace_id        VARCHAR(36),
     prev_hash       VARCHAR(80) NOT NULL,
     current_hash    VARCHAR(80) NOT NULL UNIQUE,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -197,6 +205,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
 CREATE INDEX IF NOT EXISTS ix_audit_action ON audit_log(action);
 CREATE INDEX IF NOT EXISTS ix_audit_created ON audit_log(created_at DESC);
 CREATE INDEX IF NOT EXISTS ix_audit_target ON audit_log(target);
+CREATE INDEX IF NOT EXISTS ix_audit_operator_created ON audit_log(operator, created_at DESC);
 
 -- GxP 硬性约束：禁止 UPDATE / DELETE
 -- 使用触发器抛异常而非 RULE DO INSTEAD NOTHING（后者静默吞掉操作，掩盖错误）
@@ -214,6 +223,17 @@ CREATE TRIGGER trg_audit_log_no_update BEFORE UPDATE ON audit_log
 DROP TRIGGER IF EXISTS trg_audit_log_no_delete ON audit_log;
 CREATE TRIGGER trg_audit_log_no_delete BEFORE DELETE ON audit_log
     FOR EACH ROW EXECUTE FUNCTION audit_log_immutable_guard();
+
+-- TRUNCATE 不触发 DELETE 触发器 —— 必须单独拦截，否则一次 TRUNCATE 即可清空全部审计记录
+CREATE OR REPLACE FUNCTION audit_log_no_truncate_guard() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'audit_log 表受 GxP 合规保护，禁止 TRUNCATE 操作';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_audit_log_no_truncate ON audit_log;
+CREATE TRIGGER trg_audit_log_no_truncate BEFORE TRUNCATE ON audit_log
+    FOR STATEMENT EXECUTE FUNCTION audit_log_no_truncate_guard();
 
 -- 触发器：自动更新 updated_at
 CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS trigger AS $$
@@ -246,11 +266,31 @@ CREATE TABLE IF NOT EXISTS signatures (
 );
 CREATE INDEX IF NOT EXISTS ix_signatures_case ON signatures(case_id);
 CREATE INDEX IF NOT EXISTS ix_signatures_signer ON signatures(signer_id);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_signatures_case_meaning_signer ON signatures(case_id, signature_meaning, signer_id);
+
+-- 电子签名记录同样是 GxP 关键记录 —— 禁止 UPDATE/DELETE/TRUNCATE
+CREATE OR REPLACE FUNCTION signatures_immutable_guard() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'signatures 表受 21 CFR Part 11 保护，禁止 % 操作', TG_OP;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_signatures_no_update ON signatures;
+CREATE TRIGGER trg_signatures_no_update BEFORE UPDATE ON signatures
+    FOR EACH ROW EXECUTE FUNCTION signatures_immutable_guard();
+
+DROP TRIGGER IF EXISTS trg_signatures_no_delete ON signatures;
+CREATE TRIGGER trg_signatures_no_delete BEFORE DELETE ON signatures
+    FOR EACH ROW EXECUTE FUNCTION signatures_immutable_guard();
+
+DROP TRIGGER IF EXISTS trg_signatures_no_truncate ON signatures;
+CREATE TRIGGER trg_signatures_no_truncate BEFORE TRUNCATE ON signatures
+    FOR STATEMENT EXECUTE FUNCTION signatures_immutable_guard();
 
 -- ============================================================
 --  updated_at 触发器（已建在上方）
 -- ============================================================
-COMMENT ON TABLE audit_log IS 'GxP 审计日志 — 不可篡改，DB RULE 阻止 UPDATE/DELETE';
-COMMENT ON COLUMN audit_log.current_hash IS 'sha256(prev_hash|seq|operator|action|target|detail|ts|evidence_refs)';
+COMMENT ON TABLE audit_log IS 'GxP 审计日志 — 不可篡改，DB 触发器阻止 UPDATE/DELETE/TRUNCATE';
+COMMENT ON COLUMN audit_log.current_hash IS 'sha256(v2|prev_hash|seq|operator|action|target|detail|ts|evidence_refs|ip|session|ai_model|ai_prompt_hash|ai_output_hash|trace_id)';
 COMMENT ON COLUMN evidence.content_hash IS 'sha256(raw_data_json_normalized)';
 COMMENT ON TABLE deviations IS '偏差案例主表';

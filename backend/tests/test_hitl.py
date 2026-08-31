@@ -9,14 +9,13 @@
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 
 import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.models import Deviation
-
 
 pytestmark = pytest.mark.asyncio
 
@@ -29,7 +28,7 @@ async def hitl_case(test_db: AsyncSession, seed_db):
         title="HITL 测试案例",
         severity="major",
         status="investigating",
-        discovered_at=datetime.now(timezone.utc),
+        discovered_at=datetime.now(UTC),
         investigator_id="U-LC",
         qa_reviewer_id="U-JW",
         progress=40,
@@ -66,13 +65,31 @@ class TestHitlAccept:
     async def test_accept_gate2(
         self, case_app_client: AsyncClient, auth_headers: dict, hitl_case
     ):
-        """accept gate2"""
+        """accept gate2（须先通过 gate1 —— 关卡顺序强制）"""
+        resp = await case_app_client.put(
+            f"/api/v1/cases/{hitl_case.id}/hitl/gate1",
+            json={"gate_id": "gate1", "action": "accept"},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200, resp.text
         resp = await case_app_client.put(
             f"/api/v1/cases/{hitl_case.id}/hitl/gate2",
             json={"gate_id": "gate2", "action": "accept"},
             headers=auth_headers,
         )
         assert resp.status_code == 200, resp.text
+
+    async def test_gate_order_enforced(
+        self, case_app_client: AsyncClient, auth_headers: dict, hitl_case
+    ):
+        """跳过 gate1 直接处理 gate2 → 400（顺序强制）"""
+        resp = await case_app_client.put(
+            f"/api/v1/cases/{hitl_case.id}/hitl/gate2",
+            json={"gate_id": "gate2", "action": "accept"},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 400, resp.text
+        assert "顺序" in resp.json()["message"]
 
     async def test_all_gates_done_sets_reviewing(
         self, case_app_client: AsyncClient, auth_headers: dict, hitl_case
@@ -102,7 +119,14 @@ class TestHitlReject:
     async def test_reject_gate3(
         self, case_app_client: AsyncClient, auth_headers: dict, hitl_case
     ):
-        """gate3 reject → pending + 触发 Reasoner（审计日志）"""
+        """gate3 reject → rejected + 触发 Reasoner 自动重试（须先通过 gate1/gate2）"""
+        for gate in ["gate1", "gate2"]:
+            r = await case_app_client.put(
+                f"/api/v1/cases/{hitl_case.id}/hitl/{gate}",
+                json={"gate_id": gate, "action": "accept"},
+                headers=auth_headers,
+            )
+            assert r.status_code == 200, r.text
         resp = await case_app_client.put(
             f"/api/v1/cases/{hitl_case.id}/hitl/gate3",
             json={

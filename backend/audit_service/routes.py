@@ -1,11 +1,13 @@
-"""Audit Service — 审计日志查询/验证/导出"""
-from __future__ import annotations
+"""Audit Service — 审计日志查询/验证/导出
 
+注意：本文件不使用 `from __future__ import annotations`（PEP 563）——
+slowapi 包装端点的字符串注解解析会落到 slowapi 模块命名空间导致 NameError。
+"""
 import csv
 import io
 import json
-from datetime import datetime
-from typing import List, Optional
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
@@ -20,16 +22,29 @@ from shared.schemas import AuditLogCreate, AuditLogOut, Page
 
 router = APIRouter(prefix="/audit", tags=["audit"])
 
+# 导出流式分窗大小
+_EXPORT_CHUNK = 500
+
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(value: str | None) -> str:
+    """CSV 公式注入防护 —— 以 =/+/-/@/Tab 开头的单元格前置单引号"""
+    v = str(value or "")
+    if v.startswith(_CSV_FORMULA_PREFIXES):
+        return "'" + v
+    return v
+
 
 @router.get("/logs", response_model=Page[AuditLogOut], summary="查询审计日志")
 @api_limit
 async def list_logs(
     request: Request,
-    case_id: Optional[str] = Query(default=None, description="按案例 ID 过滤"),
-    operator: Optional[str] = Query(default=None, description="按操作员过滤"),
-    action: Optional[str] = Query(default=None, description="按动作过滤"),
-    start: Optional[datetime] = Query(default=None, description="起始时间 ISO8601"),
-    end: Optional[datetime] = Query(default=None, description="结束时间 ISO8601"),
+    case_id: str | None = Query(default=None, description="按案例 ID 过滤"),
+    operator: str | None = Query(default=None, description="按操作员过滤"),
+    action: str | None = Query(default=None, description="按动作过滤"),
+    start: datetime | None = Query(default=None, description="起始时间 ISO8601"),
+    end: datetime | None = Query(default=None, description="结束时间 ISO8601"),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, ge=1, le=500),
     db: AsyncSession = Depends(get_db_from_auth),
@@ -76,13 +91,17 @@ async def verify_chain(
     db: AsyncSession = Depends(get_db_from_auth),
     _: AuthContext = Depends(require("audit:read")),
 ) -> dict:
-    """验证整个 hash 链 — 任何篡改都会返回 valid=false"""
+    """验证整个 hash 链 — 任何篡改都会返回 valid=false（流式分窗校验，不整表加载）"""
     valid = await verify_hash_chain(db, start_seq=1)
-    count = (await db.execute(select(AuditLog).with_only_columns(AuditLog.seq).order_by(desc(AuditLog.seq)).limit(1))).first()
+    count = (
+        await db.execute(
+            select(AuditLog).with_only_columns(AuditLog.seq).order_by(desc(AuditLog.seq)).limit(1)
+        )
+    ).first()
     return {
         "valid": valid,
         "total_logs": count[0] if count else 0,
-        "verified_at": datetime.utcnow().isoformat(),
+        "verified_at": datetime.now(UTC).isoformat(),
     }
 
 
@@ -92,26 +111,59 @@ async def write_log(
     request: Request,
     body: AuditLogCreate,
     db: AsyncSession = Depends(get_db_from_auth),
-    auth: AuthContext = Depends(require("audit:read")),
+    auth: AuthContext = Depends(require("system:configure")),
 ) -> AuditLogOut:
     """写入一条审计日志 — 自动维护 hash 链
 
-    注意：通常审计日志由其他服务在业务操作时通过 append_audit_log 直接写入。
-    此端点用于测试和补充写入。
+    GxP 可归因性约束：
+    - 仅 admin（system:configure）可调用 —— 旧版 audit:read 让任何调查员都能伪造他人署名
+    - operator 强制取当前认证用户；客户端声明值不一致时仅记入 detail 供追溯
     """
+    declared = body.operator
+    detail = body.detail or ""
+    if declared and declared != auth.email:
+        detail = f"[declared_operator={declared}（与认证身份不符，已强制归因到认证用户）] {detail}"
+
     log = await append_audit_log(
         db,
-        operator=body.operator,
+        operator=auth.email,  # 强制归因
         action=body.action,
         target=body.target,
-        detail=body.detail,
+        detail=detail,
         ip_address=body.ip_address or auth.ip_address,
         session_id=auth.session_id,
         evidence_refs=body.evidence_refs,
         ai_model=body.ai_model,
+        ai_prompt_hash=body.ai_prompt_hash,
         ai_output_hash=body.ai_output_hash,
     )
     return AuditLogOut.model_validate(log)
+
+
+def _export_filename(format: str) -> str:
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    return f"audit_export_{timestamp}.{format}"
+
+
+async def _iter_logs(db: AsyncSession, *, case_id: str | None, start, end) -> AsyncIterator[AuditLog]:
+    """按 seq 游标分窗流式读取审计日志（旧实现一次性加载全表到内存）"""
+    cursor = 0
+    while True:
+        stmt = select(AuditLog).where(AuditLog.seq > cursor).order_by(AuditLog.seq).limit(_EXPORT_CHUNK)
+        if case_id:
+            stmt = stmt.where(AuditLog.target.like(f"{case_id}%"))
+        if start:
+            stmt = stmt.where(AuditLog.created_at >= start)
+        if end:
+            stmt = stmt.where(AuditLog.created_at <= end)
+        rows = (await db.execute(stmt)).scalars().all()
+        if not rows:
+            return
+        for r in rows:
+            cursor = r.seq
+            yield r
+        if len(rows) < _EXPORT_CHUNK:
+            return
 
 
 @router.get("/export", summary="导出审计包（CSV/JSON）")
@@ -119,57 +171,63 @@ async def write_log(
 async def export_logs(
     request: Request,
     format: str = Query(default="csv", pattern="^(csv|json)$"),
-    case_id: Optional[str] = None,
-    start: Optional[datetime] = None,
-    end: Optional[datetime] = None,
+    case_id: str | None = None,
+    start: datetime | None = None,
+    end: datetime | None = None,
     db: AsyncSession = Depends(get_db_from_auth),
     _: AuthContext = Depends(require("audit:export")),
 ) -> StreamingResponse:
-    """导出审计日志包 — 用于 GxP 监管提交"""
-    stmt = select(AuditLog).order_by(AuditLog.seq)
-    if case_id:
-        stmt = stmt.where(AuditLog.target.like(f"{case_id}%"))
-    if start:
-        stmt = stmt.where(AuditLog.created_at >= start)
-    if end:
-        stmt = stmt.where(AuditLog.created_at <= end)
-
-    rows = (await db.execute(stmt)).scalars().all()
-
-    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    filename = f"audit_export_{timestamp}.{'csv' if format == 'csv' else 'json'}"
+    """导出审计日志包 — 用于 GxP 监管提交（流式生成，支持百万行级审计库）"""
+    filename = _export_filename(format)
 
     if format == "csv":
-        buf = io.StringIO()
-        writer = csv.writer(buf)
-        writer.writerow([
+        header = [
             "seq", "log_id", "timestamp", "operator", "action", "target",
             "detail", "ip_address", "session_id", "evidence_refs",
-            "ai_model", "ai_output_hash", "prev_hash", "current_hash",
-        ])
-        for r in rows:
-            writer.writerow([
-                r.seq, r.log_id, r.created_at.isoformat(), r.operator,
-                r.action, r.target or "", r.detail or "",
-                r.ip_address or "", r.session_id or "",
-                "|".join(r.evidence_refs or []),
-                r.ai_model or "", r.ai_output_hash or "",
-                r.prev_hash, r.current_hash,
-            ])
-        content = buf.getvalue()
-        media = "text/csv"
-    else:
-        items = [AuditLogOut.model_validate(r).model_dump(mode="json") for r in rows]
-        content = json.dumps({
-            "exported_at": timestamp,
-            "total": len(items),
-            "logs": items,
-        }, ensure_ascii=False, indent=2)
-        media = "application/json"
+            "ai_model", "ai_prompt_hash", "ai_output_hash", "trace_id",
+            "prev_hash", "current_hash",
+        ]
+
+        async def csv_gen() -> AsyncIterator[bytes]:
+            buf = io.StringIO()
+            writer = csv.writer(buf)
+            writer.writerow(header)
+            yield buf.getvalue().encode("utf-8")
+            count = 0
+            async for r in _iter_logs(db, case_id=case_id, start=start, end=end):
+                buf.seek(0)
+                buf.truncate(0)
+                writer.writerow([
+                    _csv_safe(r.seq), _csv_safe(r.log_id), _csv_safe(r.created_at.isoformat()),
+                    _csv_safe(r.operator), _csv_safe(r.action), _csv_safe(r.target),
+                    _csv_safe(r.detail), _csv_safe(r.ip_address), _csv_safe(r.session_id),
+                    _csv_safe("|".join(r.evidence_refs or [])),
+                    _csv_safe(r.ai_model), _csv_safe(r.ai_prompt_hash), _csv_safe(r.ai_output_hash),
+                    _csv_safe(r.trace_id),
+                    _csv_safe(r.prev_hash), _csv_safe(r.current_hash),
+                ])
+                yield buf.getvalue().encode("utf-8")
+                count += 1
+
+        return StreamingResponse(
+            csv_gen(),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    async def json_gen() -> AsyncIterator[bytes]:
+        yield b'{"exported_at": "' + filename.encode() + b'", "logs": ['
+        first = True
+        async for r in _iter_logs(db, case_id=case_id, start=start, end=end):
+            item = AuditLogOut.model_validate(r).model_dump(mode="json")
+            payload = json.dumps(item, ensure_ascii=False)
+            yield (payload if first else "," + payload).encode("utf-8")
+            first = False
+        yield b']}'
 
     return StreamingResponse(
-        iter([content.encode("utf-8")]),
-        media_type=media,
+        json_gen(),
+        media_type="application/json",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
@@ -192,9 +250,9 @@ async def list_flags_endpoint(
 @api_limit
 async def reload_flags_endpoint(
     request: Request,
-    _: AuthContext = Depends(require("audit:read")),
+    _: AuthContext = Depends(require("system:configure")),
 ) -> dict:
-    """热重载 feature flag 配置 —— 修改环境变量/配置文件后调用"""
+    """热重载 feature flag 配置 —— 修改环境变量/配置文件后调用（admin only）"""
     from shared.feature_flag import reload_flags as _reload_flags
     _reload_flags()
     return {"status": "ok", "message": "feature flag 配置已重新加载"}

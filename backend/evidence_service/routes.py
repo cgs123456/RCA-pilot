@@ -1,33 +1,41 @@
-﻿"""Evidence Service — 证据查询 + 时间线 + Connector 编排 + 语义检索"""
-from __future__ import annotations
+"""Evidence Service — 证据查询 + 时间线 + Connector 编排（落库去重）+ 语义检索
 
-from datetime import datetime, timezone
-from typing import List, Optional
+注意：本文件不使用 `from __future__ import annotations`（PEP 563）——
+slowapi 包装端点的字符串注解解析会落到 slowapi 模块命名空间导致 NameError。
+"""
+import hashlib
+import json
+from datetime import UTC, datetime
+from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, Query, Request
-from sqlalchemy import desc, select
+from sqlalchemy import desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from shared.audit import append_audit_log
 from shared.auth_middleware import AuthContext, get_db_from_auth, require
 from shared.config import settings
 from shared.exceptions import ConnectorError, NotFoundError, ValidationError
 from shared.models import Evidence, TimelineEvent
 from shared.rate_limit import api_limit, write_limit
 from shared.schemas import EvidenceOut, Page, TimelineEventOut
-from shared.vector_store import search_evidence, SearchResult
+from shared.vector_store import search_evidence
 
 router = APIRouter(tags=["evidence"])
+
+# 单次 embedding API 请求的文本上限（DashScope/GLM/OpenAI 兼容接口的稳妥值）
+EMBED_BATCH_SIZE = 64
 
 
 @router.get("/evidence", response_model=Page[EvidenceOut], summary="查询证据列表")
 @api_limit
 async def list_evidence(
     request: Request,
-    case_id: Optional[str] = Query(default=None),
-    source_system: Optional[str] = Query(default=None, description="LIMS|MES|EMS|CMMS|LMS|BMS"),
-    min_confidence: Optional[int] = Query(default=None, ge=1, le=4),
-    keyword: Optional[str] = Query(default=None, description="摘要模糊搜索"),
+    case_id: str | None = Query(default=None),
+    source_system: str | None = Query(default=None, description="LIMS|MES|EMS|CMMS|LMS|BMS"),
+    min_confidence: int | None = Query(default=None, ge=1, le=4),
+    keyword: str | None = Query(default=None, description="摘要模糊搜索"),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, ge=1, le=200),
     db: AsyncSession = Depends(get_db_from_auth),
@@ -45,7 +53,6 @@ async def list_evidence(
         stmt = stmt.where(Evidence.summary.ilike(f"%{keyword}%"))
 
     # count — 使用 func.count() 而非取全行
-    from sqlalchemy import func
     count_stmt = select(func.count()).select_from(Evidence)
     if case_id:
         count_stmt = count_stmt.where(Evidence.case_id == case_id)
@@ -83,14 +90,14 @@ async def get_evidence(
     return EvidenceOut.model_validate(ev)
 
 
-@router.get("/cases/{case_id}/timeline", response_model=List[TimelineEventOut], summary="案例时间线")
+@router.get("/cases/{case_id}/timeline", response_model=list[TimelineEventOut], summary="案例时间线")
 @api_limit
 async def get_timeline(
     request: Request,
     case_id: str,
     db: AsyncSession = Depends(get_db_from_auth),
     _: AuthContext = Depends(require("evidence:read")),
-) -> List[TimelineEventOut]:
+) -> list[TimelineEventOut]:
     """获取案例的时间线事件 — 按时间排序"""
     rows = (await db.execute(
         select(TimelineEvent)
@@ -100,12 +107,117 @@ async def get_timeline(
     return [TimelineEventOut.model_validate(r) for r in rows]
 
 
-@router.post("/evidence/fetch-from-source", summary="从源系统拉取增量证据（触发 Connector）")
+# ============================================================
+#  Connector 编排（拉取 → 去重 → 落库 → 审计）
+# ============================================================
+def _content_hash(source: str, item: Any) -> str:
+    """对证据内容做 SHA-256 —— 内容寻址去重的依据"""
+    canonical = json.dumps({"source": source, "item": item}, ensure_ascii=False, sort_keys=True, default=str)
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _extract_items(data: Any) -> list[dict[str, Any]]:
+    """把 Connector 的响应体归一化为证据条目列表"""
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
+    if isinstance(data, dict):
+        for key in ("items", "employees", "exceedances", "anomalies", "ahus", "batches", "records"):
+            v = data.get(key)
+            if isinstance(v, list):
+                return [x for x in v if isinstance(x, dict)]
+        return [data]  # 单对象响应
+    return []
+
+
+def _summary_of(source: str, item: dict[str, Any]) -> str:
+    """从条目提取可读摘要（按各 Connector 常见字段名）"""
+    for key in ("summary", "alert", "message", "description", "course_name", "anomaly_type", "exceedance_type"):
+        v = item.get(key)
+        if isinstance(v, str) and v.strip():
+            return f"[{source}] {v.strip()}"
+    # 兜底：取前 3 个字段拼接
+    parts = [f"{k}={v}" for k, v in list(item.items())[:3]]
+    return f"[{source}] " + ", ".join(parts) if parts else f"[{source}] 证据条目"
+
+
+def _collected_at_of(item: dict[str, Any]) -> datetime:
+    for key in ("timestamp", "collected_at", "detected_at", "occurred_at", "recorded_at", "created_at"):
+        v = item.get(key)
+        if isinstance(v, str) and v:
+            try:
+                return datetime.fromisoformat(v.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+    return datetime.now(UTC)
+
+
+async def _derive_employee_id(db: AsyncSession, case_id: str | None) -> str | None:
+    """从案例已有 LMS 证据推导员工号 —— 不再硬编码 EMP-2187"""
+    if not case_id:
+        return None
+    rows = (await db.execute(
+        select(Evidence)
+        .where(Evidence.case_id == case_id)
+        .where(Evidence.source_system == "LMS")
+        .order_by(desc(Evidence.collected_at))
+        .limit(5)
+    )).scalars().all()
+    for ev in rows:
+        rd = ev.raw_data if isinstance(ev.raw_data, dict) else {}
+        for key in ("employee_id", "employeeId", "emp_id"):
+            v = rd.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        # 嵌套结构兜底
+        for nested in rd.values():
+            if isinstance(nested, dict):
+                for key in ("employee_id", "employeeId", "emp_id"):
+                    v = nested.get(key)
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+    return None
+
+
+async def _persist_fetched_evidence(
+    db: AsyncSession,
+    *,
+    source: str,
+    case_id: str | None,
+    items: list[dict[str, Any]],
+) -> int:
+    """证据落库（content_hash 去重，内容寻址 ID 天然幂等）。返回新增条数。"""
+    new_count = 0
+    now = datetime.now(UTC)
+    for item in items:
+        chash = _content_hash(source, item)
+        ev_id = f"E-{source}-{chash.split(':', 1)[1][:10]}"
+        exists = (await db.execute(
+            select(func.count()).select_from(Evidence).where(Evidence.id == ev_id)
+        )).scalar_one()
+        if exists:
+            continue
+        db.add(Evidence(
+            id=ev_id,
+            case_id=case_id,
+            source_system=source,
+            collected_at=_collected_at_of(item),
+            summary=_summary_of(source, item),
+            raw_data=item,
+            content_hash=chash,
+            confidence=3,
+            is_signed=False,
+            created_at=now,
+        ))
+        new_count += 1
+    return new_count
+
+
+@router.post("/evidence/fetch-from-source", summary="从源系统拉取增量证据（触发 Connector 并落库）")
 @write_limit
 async def fetch_from_source(
     request: Request,
     source: str = Query(..., description="源系统代码：LMS|BMS|EMS|MES"),
-    case_id: Optional[str] = None,
+    case_id: str | None = None,
     db: AsyncSession = Depends(get_db_from_auth),
     auth: AuthContext = Depends(require("evidence:write")),
 ) -> dict:
@@ -113,6 +225,8 @@ async def fetch_from_source(
 
     Phase 1: 仅对接 LMS Mock
     Phase 2 改进6: 新增 BMS / EMS / MES Connector
+
+    拉取后的证据会 content_hash 去重落库（GxP: Original + 完整性），并写入审计日志。
     """
     if source not in ("LMS", "BMS", "EMS", "MES", "LIMS", "CMMS"):
         raise ConnectorError(f"不支持的源系统: {source}")
@@ -135,39 +249,51 @@ async def fetch_from_source(
         }
     base_url, path = entry
 
-    # 查询参数：LMS 用 employee_id 过滤，其他 Connector 不带参数
-    params = {}
-    if source == "LMS" and case_id:
-        params["employee_id"] = "EMP-2187"
+    # 查询参数：LMS 用 employee_id 过滤 —— 从案例已有证据推导，不硬编码
+    params: dict[str, Any] = {}
+    if source == "LMS":
+        employee_id = await _derive_employee_id(db, case_id)
+        if employee_id:
+            params["employee_id"] = employee_id
+    if source == "MES" and case_id:
+        params["case_id"] = case_id
 
     try:
+        # 服务间调用鉴权（connector 端点要求 X-Service-Key；dev 未配置时省略）
+        headers = {"X-Service-Key": settings.service_api_key} if settings.service_api_key else {}
         async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.get(f"{base_url.rstrip('/')}{path}", params=params)
+            resp = await client.get(f"{base_url.rstrip('/')}{path}", params=params, headers=headers)
             resp.raise_for_status()
             data = resp.json()
     except httpx.HTTPError as e:
-        raise ConnectorError(f"{source} Connector 调用失败: {e}")
+        raise ConnectorError(f"{source} Connector 调用失败: {e}") from e
 
-    # 统计拉取条数（data 可能是 dict 或 list）—— 优先用 total 字段，其次 items/employees 长度
-    if isinstance(data, list):
-        fetched_count = len(data)
-    elif isinstance(data, dict):
-        if "total" in data and isinstance(data["total"], int):
-            fetched_count = data["total"]
-        elif "items" in data:
-            fetched_count = len(data["items"])
-        elif "employees" in data:
-            fetched_count = len(data["employees"])
-        else:
-            fetched_count = 1
-    else:
-        fetched_count = 1
+    items = _extract_items(data)
+    fetched_count = len(items)
+
+    # 落库 + 审计（拉取的证据成为平台 Original 记录，必须可追溯）
+    new_count = await _persist_fetched_evidence(db, source=source, case_id=case_id, items=items)
+    await append_audit_log(
+        db,
+        operator=auth.email,
+        action="EVIDENCE_FETCHED",
+        target=f"{source}/{case_id}" if case_id else source,
+        detail=(
+            f"从 {source} Connector 拉取 {fetched_count} 条，新增落库 {new_count} 条"
+            f"（content_hash 去重）"
+        ),
+        ip_address=auth.ip_address,
+        session_id=auth.session_id,
+        evidence_refs=[],
+    )
 
     return {
         "status": "ok",
         "source": source,
+        "case_id": case_id,
         "data": data,
         "fetched_count": fetched_count,
+        "persisted_count": new_count,
         "triggered_by": auth.email,
     }
 
@@ -187,6 +313,7 @@ async def embed_evidence(
 
     - 调用 LLM provider 的 embedding API（GLM/Qwen/OpenAI）
     - 向量存储在 evidence.embedding 字段（JSONB）
+    - 变更写入审计日志（GxP: 证据元数据变更可追溯）
     - LLM 未配置时返回 400 错误，提示配置方法
     """
     ev = (await db.execute(select(Evidence).where(Evidence.id == evidence_id))).scalar_one_or_none()
@@ -196,7 +323,7 @@ async def embed_evidence(
     if not ev.summary:
         raise ValidationError("证据无摘要内容，无法生成 embedding")
 
-    from shared.llm_client import llm_client, LLMError
+    from shared.llm_client import LLMError, llm_client
     try:
         if not llm_client.supports_embeddings:
             return {
@@ -207,12 +334,24 @@ async def embed_evidence(
             }
         embedding = await llm_client.embed_text(ev.summary)
     except LLMError as e:
-        raise ValidationError(f"Embedding 生成失败: {e}")
+        raise ValidationError(f"Embedding 生成失败: {e}") from e
 
     ev.embedding = embedding
     ev.embedding_model = llm_client.embedding_model_name
-    ev.embedded_at = datetime.now(timezone.utc)
-    await db.commit()
+    ev.embedded_at = datetime.now(UTC)
+
+    # 证据行被变更 —— 必须写审计（旧行为裸 commit 无审计，ALCOA+ 违规）
+    await append_audit_log(
+        db,
+        operator=auth.email,
+        action="EVIDENCE_EMBEDDED",
+        target=evidence_id,
+        detail=(
+            f"证据向量化：model={llm_client.embedding_model_name}, dim={len(embedding)}"
+        ),
+        ip_address=auth.ip_address,
+        session_id=auth.session_id,
+    )
 
     return {
         "status": "ok",
@@ -227,13 +366,19 @@ async def embed_evidence(
 @write_limit
 async def embed_evidence_batch(
     request: Request,
-    case_id: Optional[str] = Query(default=None, description="仅嵌入指定案例的证据，不传则全部"),
+    case_id: str | None = Query(default=None, description="仅嵌入指定案例的证据，不传则全部"),
     limit: int = Query(default=100, ge=1, le=500),
     db: AsyncSession = Depends(get_db_from_auth),
     auth: AuthContext = Depends(require("evidence:write")),
 ) -> dict:
-    """批量嵌入证据（跳过已嵌入的）"""
-    from shared.llm_client import llm_client, LLMError
+    """批量嵌入证据
+
+    - 分批 ≤64 条调用 embedding API（超过部分 provider 会直接 400）
+    - 只嵌入 embedding_model 为空或与当前模型不同的证据（切换模型后重嵌，避免
+      不同维度向量混存导致余弦恒为 0）
+    - FOR UPDATE SKIP LOCKED（PG）防止并发批量请求重复嵌入同一批
+    """
+    from shared.llm_client import LLMError, llm_client
 
     if not llm_client.supports_embeddings:
         return {
@@ -242,31 +387,55 @@ async def embed_evidence_batch(
             "embedded_count": 0,
         }
 
-    # 查找未嵌入的证据
-    stmt = select(Evidence).where(Evidence.embedding.is_(None)).where(Evidence.summary.isnot(None))
+    model_name = llm_client.embedding_model_name
+
+    # 查找待嵌入证据：未嵌入 或 模型不一致（模型切换后需要重嵌）
+    stmt = (
+        select(Evidence)
+        .where(Evidence.summary.isnot(None))
+        .where(
+            or_(
+                Evidence.embedding.is_(None),
+                Evidence.embedding_model.is_(None),
+                Evidence.embedding_model != model_name,
+            )
+        )
+        .order_by(Evidence.created_at.desc())
+    )
     if case_id:
         stmt = stmt.where(Evidence.case_id == case_id)
     stmt = stmt.limit(limit)
+    # PG 行锁：并发批量请求不会重复嵌入同一批；SQLite（测试）忽略 FOR UPDATE
+    stmt = stmt.with_for_update(skip_locked=True)
     evidences = (await db.execute(stmt)).scalars().all()
 
     if not evidences:
         return {"status": "ok", "embedded_count": 0, "message": "无待嵌入证据"}
 
-    # 批量嵌入
-    texts = [ev.summary for ev in evidences]
-    try:
-        embeddings = await llm_client.embed_texts(texts)
-    except LLMError as e:
-        raise ValidationError(f"批量嵌入失败: {e}")
+    # 按 64 条分批调用（Qwen/GLM/OpenAI 兼容接口单批上限差异较大，64 为稳妥值）
+    embeddings: list[list[float]] = []
+    for i in range(0, len(evidences), EMBED_BATCH_SIZE):
+        chunk = [ev.summary for ev in evidences[i:i + EMBED_BATCH_SIZE]]
+        try:
+            embeddings.extend(await llm_client.embed_texts(chunk))
+        except LLMError as e:
+            raise ValidationError(f"批量嵌入失败（第 {i // EMBED_BATCH_SIZE + 1} 批）: {e}") from e
 
-    now = datetime.now(timezone.utc)
-    model_name = llm_client.embedding_model_name
-    for ev, emb in zip(evidences, embeddings):
+    now = datetime.now(UTC)
+    for ev, emb in zip(evidences, embeddings, strict=False):
         ev.embedding = emb
         ev.embedding_model = model_name
         ev.embedded_at = now
 
-    await db.commit()
+    await append_audit_log(
+        db,
+        operator=auth.email,
+        action="EVIDENCE_EMBED_BATCH",
+        target=case_id or "*",
+        detail=f"批量向量化 {len(evidences)} 条证据（model={model_name}）",
+        ip_address=auth.ip_address,
+        session_id=auth.session_id,
+    )
 
     return {
         "status": "ok",
@@ -282,7 +451,7 @@ async def semantic_search(
     request: Request,
     q: str = Query(..., min_length=1, description="查询文本"),
     top_k: int = Query(default=10, ge=1, le=50),
-    exclude_case_id: Optional[str] = Query(default=None, description="排除该案例的证据"),
+    exclude_case_id: str | None = Query(default=None, description="排除该案例的证据"),
     db: AsyncSession = Depends(get_db_from_auth),
     _: AuthContext = Depends(require("evidence:read")),
 ) -> dict:
@@ -296,7 +465,7 @@ async def semantic_search(
     search_mode = "keyword"
     embedding_error = None
 
-    from shared.llm_client import llm_client, LLMError
+    from shared.llm_client import LLMError, llm_client
     if llm_client.supports_embeddings:
         try:
             query_embedding = await llm_client.embed_text(q)
@@ -338,7 +507,7 @@ async def find_related_cases(
     request: Request,
     q: str = Query(..., min_length=1, description="当前案例的关键描述"),
     top_k: int = Query(default=5, ge=1, le=20),
-    exclude_case_id: Optional[str] = Query(default=None, description="当前案例 ID，从结果排除"),
+    exclude_case_id: str | None = Query(default=None, description="当前案例 ID，从结果排除"),
     db: AsyncSession = Depends(get_db_from_auth),
     _: AuthContext = Depends(require("evidence:read")),
 ) -> dict:
@@ -346,8 +515,8 @@ async def find_related_cases(
 
     返回按相关度聚合的案例列表（含证据 ID + 相似度评分）
     """
+    from shared.llm_client import LLMError, llm_client
     from shared.vector_store import find_related_cases as _find_related
-    from shared.llm_client import llm_client, LLMError
 
     query_embedding = None
     embedding_error = None

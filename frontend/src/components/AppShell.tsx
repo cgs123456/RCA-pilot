@@ -2,6 +2,7 @@
  * App Shell — 左侧导航 + 顶栏 + 主内容区
  */
 import { useState } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import {
   LayoutDashboard, Inbox, FlaskConical, FileText, ShieldCheck,
@@ -10,7 +11,16 @@ import {
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/auth.store';
 import { cn, roleLabel } from '@/lib/utils';
-import { Badge } from './ui/Badge';
+
+// 各角色可见的导航分组（仅前端视觉控制；权限硬校验在后端 RBAC）
+const ROLE_NAV: Record<string, string[] | 'all'> = {
+  admin: 'all',
+  qa_reviewer: ['工作台', '调查', '合规'],
+  investigator: ['工作台', '调查'],
+  ops_manager: ['工作台'],
+  auditor: ['合规'],
+  operator: ['工作台'],
+};
 
 const NAV_GROUPS = [
   {
@@ -41,10 +51,15 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const [collapsed, setCollapsed] = useState(false);
   const location = useLocation();
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const { user, logout } = useAuthStore();
+
+  const allowedGroups = ROLE_NAV[user?.role || ''] ?? ['工作台'];
 
   const handleLogout = async () => {
     await logout();
+    // 清空 TanStack Query 缓存 —— 公用终端换账号不得看到上一用户的案例/KPI 数据
+    queryClient.clear();
     navigate('/login');
   };
 
@@ -72,7 +87,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
         {/* 导航菜单 */}
         <nav className="flex-1 overflow-y-auto py-3">
-          {NAV_GROUPS.map((group) => (
+          {NAV_GROUPS.filter((group) => allowedGroups === 'all' || allowedGroups.includes(group.title)).map((group) => (
             <div key={group.title} className="mb-4">
               {!collapsed && (
                 <div className="px-4 mb-1.5 text-[10px] uppercase tracking-wider text-ink-500 font-semibold">

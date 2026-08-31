@@ -1,12 +1,13 @@
 """MES Mock Connector — 生产执行系统只读 API"""
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import List, Optional
+from datetime import UTC, datetime
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 
-router = APIRouter(prefix="/mes", tags=["mes-connector"])
+from shared.connector_auth import require_connector_auth
+
+router = APIRouter(prefix="/mes", tags=["mes-connector"], dependencies=[Depends(require_connector_auth)])
 
 
 # ============================================================
@@ -108,7 +109,7 @@ async def health():
     return {
         "status": "healthy",
         "service": "mes-connector",
-        "data_freshness": "2025-08-17T06:00:00+08:00",
+        "data_freshness": datetime.now(UTC).astimezone().isoformat(),
         "is_readonly": True,
     }
 
@@ -130,15 +131,15 @@ async def get_batch(batch_id: str) -> dict:
     return {
         "status": "ok",
         "source": "MES",
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "fetched_at": datetime.now(UTC).isoformat(),
         "batch": batch,
     }
 
 
 @router.get("/cleaning-records", summary="查询清洁记录")
 async def list_cleaning_records(
-    room: Optional[str] = Query(default=None, description="按房间过滤"),
-    asset: Optional[str] = Query(default=None, description="按资产过滤"),
+    room: str | None = Query(default=None, description="按房间过滤"),
+    asset: str | None = Query(default=None, description="按资产过滤"),
 ) -> dict:
     """查询清洁记录 — 支持按房间/资产过滤
 
@@ -153,7 +154,7 @@ async def list_cleaning_records(
     return {
         "status": "ok",
         "source": "MES",
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "fetched_at": datetime.now(UTC).isoformat(),
         "total": len(items),
         "items": items,
     }
@@ -161,8 +162,8 @@ async def list_cleaning_records(
 
 @router.get("/cctv/anomalies", summary="查询 CCTV 更衣异常事件")
 async def list_cctv_anomalies(
-    employee_id: Optional[str] = Query(default=None, description="按员工 ID 过滤"),
-    anomaly_type: Optional[str] = Query(default=None, description="按异常类型过滤"),
+    employee_id: str | None = Query(default=None, description="按员工 ID 过滤"),
+    anomaly_type: str | None = Query(default=None, description="按异常类型过滤"),
 ) -> dict:
     """查询 CCTV 更衣异常事件 — 用于偏差调查证据收集
 
@@ -177,7 +178,7 @@ async def list_cctv_anomalies(
     return {
         "status": "ok",
         "source": "MES",
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "fetched_at": datetime.now(UTC).isoformat(),
         "total": len(items),
         "items": items,
     }

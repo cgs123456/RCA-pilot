@@ -1,12 +1,14 @@
 # ============================================================
 # RCA Pilot — 持续部署流水线（CD）
-# 触发：push 到 main 分支（CI 通过后自动部署到 staging）
-# 流程：再跑一次 lint 兜底 → 构建并推送镜像 → SSH 部署到 staging
+# 触发：CI 全部通过后（workflow_run 门禁，CI 红着不能部署）
+# 流程：构建并推送镜像（一次性构建、按服务名打多 tag）→ SBOM → SSH 部署 staging
 # ============================================================
 name: CD
 
 on:
-  push:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
     branches: [main]
   workflow_dispatch: {} # 支持手动触发
 
@@ -20,40 +22,28 @@ permissions:
   contents: read
   packages: write # 推送镜像到 ghcr.io 所需
 
+# 全部服务共用同一个后端镜像（同一 Dockerfile），按 compose 期望的服务名打 tag
+env:
+  BACKEND_SERVICES: "auth-service case-service evidence-service agent-service audit-service lms-connector bms-connector ems-connector mes-connector"
+
 jobs:
   # ============================================================
-  # Job 1: 兜底 Lint + 构建并推送 Docker 镜像
-  # 推送到 ghcr.io，tag 同时打 latest + commit sha
+  # Job 1: 构建并推送镜像 + SBOM
   # ============================================================
   build-and-push-images:
     name: Build & Push Images
     runs-on: ubuntu-22.04
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
 
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 安装 Python 3.11（兜底 lint）
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-          cache-dependency-path: backend/requirements.txt
-
-      - name: 安装后端依赖（兜底 lint）
-        working-directory: backend
+      - name: 提取镜像元数据
+        id: meta
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install ruff mypy
-
-      - name: 兜底 Lint（保险起见再跑一次）
-        working-directory: backend
-        run: |
-          ruff check .
-          mypy .
-        env:
-          PYTHONPATH: backend
+          echo "sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+          echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
 
       - name: 登录 GitHub Container Registry
         uses: docker/login-action@v3
@@ -62,21 +52,28 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 提取镜像元数据
-        id: meta
+      - name: 生成后端镜像 tag 列表（9 个服务名 + latest + sha）
+        id: backend-tags
         run: |
-          echo "sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
-          echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+          TAGS=""
+          for SVC in $BACKEND_SERVICES; do
+            TAGS="${TAGS}ghcr.io/${{ steps.meta.outputs.owner }}/${SVC}:latest
+            ghcr.io/${{ steps.meta.outputs.owner }}/${SVC}:${{ steps.meta.outputs.sha }}
+            "
+          done
+          {
+            echo "tags<<EOF"
+            echo "$TAGS"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
 
-      - name: 构建并推送后端镜像
+      - name: 构建并推送后端镜像（一次构建，多服务名 tag）
         uses: docker/build-push-action@v5
         with:
           context: .
           file: deploy/Dockerfile.backend
           push: true
-          tags: |
-            ghcr.io/${{ steps.meta.outputs.owner }}/rca-pilot-backend:latest
-            ghcr.io/${{ steps.meta.outputs.owner }}/rca-pilot-backend:${{ steps.meta.outputs.sha }}
+          tags: ${{ steps.backend-tags.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -87,14 +84,21 @@ jobs:
           file: deploy/Dockerfile.frontend
           push: true
           tags: |
-            ghcr.io/${{ steps.meta.outputs.owner }}/rca-pilot-frontend:latest
-            ghcr.io/${{ steps.meta.outputs.owner }}/rca-pilot-frontend:${{ steps.meta.outputs.sha }}
+            ghcr.io/${{ steps.meta.outputs.owner }}/frontend:latest
+            ghcr.io/${{ steps.meta.outputs.owner }}/frontend:${{ steps.meta.outputs.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # GxP 供应链：生成 SBOM，证明运行镜像与验证记录一致
+      - name: 生成 SBOM（Syft）
+        uses: anchore/sbom-action@v0
+        with:
+          format: spdx-json
+          image: ghcr.io/${{ steps.meta.outputs.owner }}/auth-service:${{ steps.meta.outputs.sha }}
+          artifact-name: rca-pilot-sbom.spdx.json
+
   # ============================================================
   # Job 2: 部署到 Staging
-  # 需要 build-and-push-images 完成
   # 通过环境保护规则要求人工审批
   # ============================================================
   deploy-staging:
@@ -106,8 +110,11 @@ jobs:
       url: ${{ steps.set-url.outputs.staging-url }}
 
     steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
+      - name: 提取镜像元数据
+        id: meta
+        run: |
+          echo "sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+          echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
 
       - name: SSH 部署到 staging 服务器
         id: deploy
@@ -117,20 +124,36 @@ jobs:
           username: ${{ secrets.STAGING_SSH_USER }}
           key: ${{ secrets.STAGING_SSH_PRIVATE_KEY }}
           port: ${{ secrets.STAGING_SSH_PORT || 22 }}
+          envs: GITHUB_SHA
           script: |
             set -e
             # 进入部署目录（docker-compose.yml 所在路径）
             cd ${{ secrets.STAGING_DEPLOY_PATH }}
 
-            # 拉取最新镜像
+            # 指向本次构建的镜像（compose pull 依赖 image: 字段 + RCA_REGISTRY/RCA_IMAGE_TAG）
+            export RCA_REGISTRY="ghcr.io/${{ steps.meta.outputs.owner }}"
+            export RCA_IMAGE_TAG="${{ steps.meta.outputs.sha }}"
+
+            # 拉取最新镜像（compose 中每个服务都有 image: 字段，pull 不再落空）
             docker compose pull
-            # 滚动重启服务（-d 后台运行）
+            # 滚动重启服务
             docker compose up -d
 
-            # 简单健康检查：等待 frontend 容器 ready
+            # 真实健康检查：等待所有服务 /health 通过（替代旧版 sleep 10）
             echo "等待服务就绪..."
-            sleep 10
+            for i in $(seq 1 30); do
+              UNHEALTHY=$(docker compose ps --format json | grep -v '"Health":"healthy"' | grep -c 'rca-' || true)
+              if [ "$UNHEALTHY" = "0" ]; then
+                echo "所有服务健康检查通过"
+                docker compose ps
+                exit 0
+              fi
+              sleep 5
+            done
+            echo "服务健康检查超时"
             docker compose ps
+            docker compose logs --tail 50
+            exit 1
 
       - name: 输出部署 URL
         id: set-url

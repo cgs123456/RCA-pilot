@@ -31,7 +31,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from typing import Any, Dict, Optional, Type, TypeVar
+import weakref
+from typing import Any, TypeVar
 
 import httpx
 from pydantic import BaseModel, ValidationError
@@ -51,13 +52,27 @@ class LLMConfigError(LLMError):
 
 
 class LLMResponseError(LLMError):
-    """LLM 响应格式异常（HTTP 非 200 / 响应缺字段 / JSON 解析失败 / Schema 校验失败）"""
+    """LLM 响应格式异常（HTTP 非 200 / 响应缺字段 / JSON 解析失败 / Schema 校验失败）
+
+    status_code：HTTP 状态码（非 HTTP 错误时为 None）。重试分类用它做数值判断，
+    不再对错误文案做字符串匹配。
+    """
+
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _is_client_error(e: Exception) -> bool:
+    """4xx（除 429）不应重试 —— 参数/鉴权问题重试无意义"""
+    status = getattr(e, "status_code", None)
+    return status is not None and 400 <= status < 500 and status != 429
 
 
 # ============================================================
 # Provider 配置 —— base_url 与鉴权头按 provider 自动选择
 # ============================================================
-_PROVIDER_DEFAULTS: Dict[str, Dict[str, str]] = {
+_PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
     # 智谱 GLM —— OpenAI 兼容协议
     "glm": {
         "base_url": "https://open.bigmodel.cn/api/paas/v4",
@@ -120,7 +135,19 @@ class LLMClient:
         self._temperature: float = settings.llm_temperature
         self._timeout: float = float(settings.llm_timeout_seconds)
         self._max_retries: int = settings.llm_max_retries
+        # httpx 连接复用：按事件循环缓存 AsyncClient（pytest 每个用例新建 loop，
+        # 模块级单例必须与 loop 绑定，否则跨 loop 复用会报 "Event loop is closed"）
+        self._http_clients: weakref.WeakKeyDictionary[Any, httpx.AsyncClient] = weakref.WeakKeyDictionary()
         self._resolve_provider_defaults()
+
+    async def _get_http_client(self) -> httpx.AsyncClient:
+        """获取当前事件循环绑定的 httpx 客户端（连接池复用，避免每请求新建 TCP/TLS）"""
+        loop = asyncio.get_running_loop()
+        client = self._http_clients.get(loop)
+        if client is None or client.is_closed:
+            client = httpx.AsyncClient(timeout=self._timeout)
+            self._http_clients[loop] = client
+        return client
 
     def _resolve_provider_defaults(self) -> None:
         """根据 provider 解析 base_url / model / auth_header / auth_scheme
@@ -145,12 +172,12 @@ class LLMClient:
     def from_override(
         cls,
         *,
-        provider: Optional[str] = None,
-        api_key: Optional[str] = None,
-        model: Optional[str] = None,
-        base_url: Optional[str] = None,
-        temperature: Optional[float] = None,
-    ) -> "LLMClient":
+        provider: str | None = None,
+        api_key: str | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        temperature: float | None = None,
+    ) -> LLMClient:
         """创建带覆盖配置的 LLMClient 新实例
 
         未指定的字段从 settings 默认值继承。用于多 Agent 博弈场景下
@@ -195,6 +222,11 @@ class LLMClient:
     def provider(self) -> str:
         return self._provider
 
+    @property
+    def identity(self) -> tuple[str, str]:
+        """(provider, model) 标识 —— 多 Agent 博弈用于校验 primary/adversary 是不同模型"""
+        return (self._provider, self._model)
+
     # ------------------------------------------------------------
     # 核心 API：chat_completion
     # ------------------------------------------------------------
@@ -204,7 +236,9 @@ class LLMClient:
         user_prompt: str,
         *,
         json_mode: bool = False,
-        extra_headers: Optional[Dict[str, str]] = None,
+        extra_headers: dict[str, str] | None = None,
+        agent_label: str = "unknown",
+        max_tokens: int | None = None,
     ) -> str:
         """调用 LLM 完成对话，返回助手回复文本
 
@@ -213,6 +247,8 @@ class LLMClient:
             user_prompt: User message
             json_mode: 是否强制 JSON 输出（OpenAI compatible response_format）
             extra_headers: 额外 HTTP 头（如 Anthropic 的 anthropic-version）
+            agent_label: 调用方 Agent 名（用于 token 计量指标）
+            max_tokens: 本次调用的输出上限（Drafter 长报告用，默认取 settings）
 
         Returns:
             str: 助手回复内容
@@ -227,35 +263,51 @@ class LLMClient:
                 f"base_url={self._base_url!r}"
             )
 
+        if self._provider == "anthropic":
+            # Anthropic 走 /v1/messages 原生协议（其无 /chat/completions 端点）
+            return await self._anthropic_chat_completion(
+                system, user_prompt, json_mode=json_mode, agent_label=agent_label, max_tokens=max_tokens
+            )
+
         url = f"{self._base_url.rstrip('/')}/chat/completions"
         headers = self._build_headers(extra_headers)
-        payload: Dict[str, Any] = {
+        payload: dict[str, Any] = {
             "model": self._model,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user_prompt},
             ],
-            "max_tokens": self._max_tokens,
+            "max_tokens": max_tokens if max_tokens is not None else self._max_tokens,
             "temperature": self._temperature,
         }
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
 
-        last_error: Optional[Exception] = None
+        last_error: Exception | None = None
         for attempt in range(self._max_retries + 1):
             try:
-                async with httpx.AsyncClient(timeout=self._timeout) as client:
-                    resp = await client.post(url, headers=headers, json=payload)
+                client = await self._get_http_client()
+                resp = await client.post(url, headers=headers, json=payload)
 
                 if resp.status_code != 200:
                     raise LLMResponseError(
-                        f"HTTP {resp.status_code}: {resp.text[:500]}"
+                        f"HTTP {resp.status_code}: {resp.text[:500]}",
+                        status_code=resp.status_code,
                     )
 
                 data = resp.json()
                 content = data["choices"][0]["message"]["content"]
                 if not content:
                     raise LLMResponseError("LLM 返回空内容")
+
+                # finish_reason=length 意味着输出被截断 —— 上游（尤其 Drafter 报告）
+                # 必须知道，否则静默产出不完整内容
+                finish_reason = data.get("choices", [{}])[0].get("finish_reason")
+                self._record_usage(agent_label, data.get("usage"), finished=finish_reason != "length")
+                if finish_reason == "length":
+                    raise LLMResponseError(
+                        f"LLM 输出被 max_tokens={payload['max_tokens']} 截断（finish_reason=length）"
+                    )
 
                 return content
 
@@ -264,8 +316,8 @@ class LLMClient:
             except (KeyError, json.JSONDecodeError) as e:
                 last_error = LLMResponseError(f"响应解析失败: {type(e).__name__}: {e}")
             except LLMResponseError as e:
-                # 4xx 客户端错误（除 429 外）不重试
-                if "HTTP 4" in str(e) and "HTTP 429" not in str(e):
+                # 4xx 客户端错误（除 429 外）不重试 —— 数值判断，不匹配文案
+                if _is_client_error(e):
                     raise
                 last_error = e
 
@@ -275,6 +327,97 @@ class LLMClient:
 
         raise last_error or LLMResponseError("LLM 调用失败：未知错误")
 
+    async def _anthropic_chat_completion(
+        self,
+        system: str,
+        user_prompt: str,
+        *,
+        json_mode: bool = False,
+        agent_label: str = "unknown",
+        max_tokens: int | None = None,
+    ) -> str:
+        """Anthropic 原生协议（/v1/messages）适配
+
+        - system 单独传参（不在 messages 里）
+        - 鉴权用 x-api-key 头 + anthropic-version
+        - 无 response_format 参数：JSON 模式在 system prompt 里追加强约束
+        """
+        url = f"{self._base_url.rstrip('/')}/messages"
+        headers = self._build_headers(None)
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "system": (f"{system}\n\n只输出合法 JSON，不要输出任何其他内容。" if json_mode else system),
+            "messages": [{"role": "user", "content": user_prompt}],
+            "max_tokens": max_tokens if max_tokens is not None else self._max_tokens,
+            "temperature": self._temperature,
+        }
+
+        last_error: Exception | None = None
+        for attempt in range(self._max_retries + 1):
+            try:
+                client = await self._get_http_client()
+                resp = await client.post(url, headers=headers, json=payload)
+
+                if resp.status_code != 200:
+                    raise LLMResponseError(
+                        f"HTTP {resp.status_code}: {resp.text[:500]}",
+                        status_code=resp.status_code,
+                    )
+
+                data = resp.json()
+                # Anthropic 响应：{"content": [{"type": "text", "text": "..."}], ...}
+                text_parts = [
+                    block.get("text", "") for block in data.get("content", []) if block.get("type") == "text"
+                ]
+                content = "".join(text_parts).strip()
+                if not content:
+                    raise LLMResponseError("LLM 返回空内容")
+
+                self._record_usage(
+                    agent_label, data.get("usage"), finished=data.get("stop_reason") != "max_tokens"
+                )
+                if data.get("stop_reason") == "max_tokens":
+                    raise LLMResponseError(
+                        f"LLM 输出被 max_tokens={payload['max_tokens']} 截断（stop_reason=max_tokens）"
+                    )
+                return content
+
+            except (httpx.TimeoutException, httpx.HTTPError) as e:
+                last_error = LLMResponseError(f"网络异常: {type(e).__name__}: {e}")
+            except (KeyError, json.JSONDecodeError) as e:
+                last_error = LLMResponseError(f"响应解析失败: {type(e).__name__}: {e}")
+            except LLMResponseError as e:
+                if _is_client_error(e):
+                    raise
+                last_error = e
+
+            if attempt < self._max_retries:
+                await asyncio.sleep(0.5 * (2 ** attempt))
+
+        raise last_error or LLMResponseError("LLM 调用失败：未知错误")
+
+    def _record_usage(self, agent_label: str, usage: dict[str, Any] | None, *, finished: bool = True) -> None:
+        """记录 token 用量到 Prometheus（成本可观测）并暂存最近一次用量"""
+        self.last_usage: dict[str, Any] = {
+            "model": self._model,
+            "prompt_tokens": (usage or {}).get("prompt_tokens") or (usage or {}).get("input_tokens") or 0,
+            "completion_tokens": (usage or {}).get("completion_tokens") or (usage or {}).get("output_tokens") or 0,
+            "truncated": not finished,
+        }
+        try:
+            from .metrics import LLM_CALLS_TOTAL, LLM_TOKENS_TOTAL
+
+            u = self.last_usage
+            if u["prompt_tokens"]:
+                LLM_TOKENS_TOTAL.labels(agent=agent_label, model=self._model, kind="prompt").inc(u["prompt_tokens"])
+            if u["completion_tokens"]:
+                LLM_TOKENS_TOTAL.labels(agent=agent_label, model=self._model, kind="completion").inc(
+                    u["completion_tokens"]
+                )
+            LLM_CALLS_TOTAL.labels(agent=agent_label, model=self._model, outcome="success").inc()
+        except Exception:
+            pass  # 指标失败不影响业务调用
+
     # ------------------------------------------------------------
     # JSON 输出 + Pydantic 校验
     # ------------------------------------------------------------
@@ -282,7 +425,10 @@ class LLMClient:
         self,
         system: str,
         user_prompt: str,
-        schema: Type[T],
+        schema: type[T],
+        *,
+        agent_label: str = "unknown",
+        max_tokens: int | None = None,
     ) -> T:
         """调用 LLM 并返回 JSON 对象（通过 Pydantic schema 校验）
 
@@ -290,6 +436,8 @@ class LLMClient:
             system: System prompt（应明确告知 LLM 输出 JSON 格式）
             user_prompt: User message
             schema: Pydantic BaseModel 子类，用于校验响应
+            agent_label: 调用方 Agent 名（token 计量）
+            max_tokens: 输出上限覆盖
 
         Returns:
             T: schema 实例
@@ -297,7 +445,9 @@ class LLMClient:
         Raises:
             LLMError: 任何 LLM 调用或校验失败
         """
-        content = await self.chat_completion(system, user_prompt, json_mode=True)
+        content = await self.chat_completion(
+            system, user_prompt, json_mode=True, agent_label=agent_label, max_tokens=max_tokens
+        )
 
         # 提取 JSON（容忍 LLM 在 JSON 前后加文字说明）
         json_str = self._extract_json(content)
@@ -318,8 +468,8 @@ class LLMClient:
     # ------------------------------------------------------------
     # 内部工具
     # ------------------------------------------------------------
-    def _build_headers(self, extra: Optional[Dict[str, str]]) -> Dict[str, str]:
-        headers: Dict[str, str] = {"Content-Type": "application/json"}
+    def _build_headers(self, extra: dict[str, str] | None) -> dict[str, str]:
+        headers: dict[str, str] = {"Content-Type": "application/json"}
         if self._auth_scheme:
             headers[self._auth_header] = f"{self._auth_scheme} {self._api_key}"
         else:
@@ -364,15 +514,15 @@ class LLMClient:
     @property
     def embedding_model_name(self) -> str:
         """当前 embedding 模型名（按 provider 选择默认）"""
-        _EMBEDDING_DEFAULTS = {
+        embedding_defaults = {
             "glm": "embedding-3",
             "qwen": "text-embedding-v3",
             "openai": "text-embedding-3-small",
             "azure": "text-embedding-3-small",
             "anthropic": "",  # Anthropic 暂不提供 embedding API
         }
-        if self._provider in _EMBEDDING_DEFAULTS:
-            return _EMBEDDING_DEFAULTS[self._provider]
+        if self._provider in embedding_defaults:
+            return embedding_defaults[self._provider]
         return ""
 
     @property
@@ -408,14 +558,14 @@ class LLMClient:
             "input": texts,
         }
 
-        last_error: Optional[Exception] = None
+        last_error: Exception | None = None
         for attempt in range(self._max_retries + 1):
             try:
-                async with httpx.AsyncClient(timeout=self._timeout) as client:
-                    resp = await client.post(url, headers=headers, json=payload)
+                client = await self._get_http_client()
+                resp = await client.post(url, headers=headers, json=payload)
 
                 if resp.status_code != 200:
-                    raise LLMResponseError(f"HTTP {resp.status_code}: {resp.text[:500]}")
+                    raise LLMResponseError(f"HTTP {resp.status_code}: {resp.text[:500]}", status_code=resp.status_code)
 
                 data = resp.json()
                 # OpenAI 兼容协议：{"data": [{"embedding": [...]}, ...]}
@@ -431,7 +581,7 @@ class LLMClient:
             except (KeyError, json.JSONDecodeError, IndexError) as e:
                 last_error = LLMResponseError(f"响应解析失败: {type(e).__name__}: {e}")
             except LLMResponseError as e:
-                if "HTTP 4" in str(e) and "HTTP 429" not in str(e):
+                if _is_client_error(e):
                     raise
                 last_error = e
 
@@ -457,7 +607,7 @@ def get_llm_client() -> LLMClient:
     return llm_client
 
 
-def get_debate_client() -> Optional[LLMClient]:
+def get_debate_client() -> LLMClient | None:
     """获取多 Agent 博弈用的 secondary LLM 客户端
 
     从 settings.llm_debate_* 配置构造独立实例（不同 provider/model/temperature）。

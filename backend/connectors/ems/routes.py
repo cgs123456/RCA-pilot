@@ -1,12 +1,13 @@
 """EMS Mock Connector — 环境监测系统只读 API"""
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import List, Optional
+from datetime import UTC, datetime
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 
-router = APIRouter(prefix="/ems", tags=["ems-connector"])
+from shared.connector_auth import require_connector_auth
+
+router = APIRouter(prefix="/ems", tags=["ems-connector"], dependencies=[Depends(require_connector_auth)])
 
 
 # ============================================================
@@ -83,7 +84,7 @@ async def health():
     return {
         "status": "healthy",
         "service": "ems-connector",
-        "data_freshness": "2025-08-17T06:00:00+08:00",
+        "data_freshness": datetime.now(UTC).astimezone().isoformat(),
         "is_readonly": True,
     }
 
@@ -94,7 +95,7 @@ async def list_points() -> dict:
     return {
         "status": "ok",
         "source": "EMS",
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "fetched_at": datetime.now(UTC).isoformat(),
         "total": len(MONITORING_POINTS),
         "items": [
             {
@@ -128,14 +129,14 @@ async def get_point_history(point_id: str) -> dict:
     return {
         "status": "ok",
         "source": "EMS",
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "fetched_at": datetime.now(UTC).isoformat(),
         **point,
     }
 
 
 @router.get("/exceedances", summary="查询环境监测超限事件")
 async def list_exceedances(
-    status: Optional[str] = Query(default=None, description="过滤状态：alert / action"),
+    status: str | None = Query(default=None, description="过滤状态：alert / action"),
 ) -> dict:
     """查询所有环境监测超限事件 — 用于偏差调查证据收集
 
@@ -151,7 +152,7 @@ async def list_exceedances(
     return {
         "status": "ok",
         "source": "EMS",
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "fetched_at": datetime.now(UTC).isoformat(),
         "total": len(items),
         "items": items,
     }

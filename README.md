@@ -2,7 +2,7 @@
 
 受 GxP 监管的 Agentic AI 偏差调查平台，面向生物制药企业提供端到端的根因分析能力。系统融合多 Agent 编排、HITL 人工决策门控、不可篡改审计链与 21 CFR Part 11 电子签名，支持从偏差告警接入到 ICH Q9 报告签发的完整闭环。
 
-> **Phase 2 更新**：6 项改进全部落地，Agent 流水线全面 LLM 化（Reasoner / Skeptic / Drafter 三大 Agent 接入 LLM Chain-of-Thought），新增多 Agent 博弈验证（双 Reasoner 并行 + Skeptic 交叉质证 + Meta-Controller 综合置信度），Evidence Hunter 升级语义检索 + 跨案例关联，Connector 扩展至 4 个（LMS + BMS + EMS + MES）。测试总数从 53 增长至 **202**（0 回归）。详见 [§ Phase 2 LLM 化改造](#phase-2-llm-化改造)。
+> **Phase 2 更新（2026-07）**：6 项改进全部落地，Agent 流水线全面 LLM 化（Reasoner / Skeptic / Drafter 三大 Agent 接入 LLM Chain-of-Thought），新增多 Agent 博弈验证（双 Reasoner 并行 + Skeptic 交叉质证 + Meta-Controller 综合置信度），Evidence Hunter 升级语义检索 + 跨案例关联，Connector 扩展至 4 个（LMS + BMS + EMS + MES）。测试总数从 53 增长至 **202+**（Roadmap 36 任务完成后新增 30+ tests）（0 回归）。详见 [§ Phase 2 LLM 化改造](#phase-2-llm-化改造)。
 
 ## 1. 项目概述
 

@@ -8,21 +8,26 @@ import {
   ShieldCheck, ShieldAlert, Download, Search, RefreshCw,
 } from 'lucide-react';
 import { auditApi } from '@/services/audit.service';
+import { useToast } from '@/components/ui/Toast';
 import { Card, CardBody, CardHeader, CardTitle } from '@/components/ui/Card';
 import { Badge } from '@/components/ui/Badge';
 import { Button } from '@/components/ui/Button';
 import { formatDateTime, timeAgo, shortHash } from '@/lib/utils';
 
 export function AuditPage() {
-  const [params, setParams] = useSearchParams();
+  const [params] = useSearchParams();
   const [keyword, setKeyword] = useState(params.get('case_id') || '');
+  const [page, setPage] = useState(1);
+  const [exporting, setExporting] = useState(false);
+  const { toast } = useToast();
+  const PAGE_SIZE = 50;
 
-  const { data: logs, refetch } = useQuery({
-    queryKey: ['audit-logs', keyword],
+  const { data: logs, isLoading, isError, refetch } = useQuery({
+    queryKey: ['audit-logs', keyword, page],
     queryFn: () => auditApi.list({
       case_id: keyword || undefined,
-      page: 1,
-      page_size: 100,
+      page,
+      page_size: PAGE_SIZE,
     }),
   });
 
@@ -42,16 +47,42 @@ export function AuditPage() {
           </p>
         </div>
         <div className="flex gap-2">
-          <a href={auditApi.exportUrl('csv', keyword || undefined)} target="_blank" rel="noreferrer">
-            <Button variant="outline" size="sm">
-              <Download className="w-3.5 h-3.5" /> 导出 CSV
-            </Button>
-          </a>
-          <a href={auditApi.exportUrl('json', keyword || undefined)} target="_blank" rel="noreferrer">
-            <Button variant="outline" size="sm">
-              <Download className="w-3.5 h-3.5" /> 导出 JSON
-            </Button>
-          </a>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={exporting}
+            onClick={async () => {
+              setExporting(true);
+              try {
+                await auditApi.exportAudit({ format: 'csv', case_id: keyword || undefined });
+                toast('审计包 CSV 导出成功', 'success');
+              } catch (e) {
+                toast((e as { message?: string })?.message || '导出失败（需要 audit:export 权限）', 'error');
+              } finally {
+                setExporting(false);
+              }
+            }}
+          >
+            <Download className="w-3.5 h-3.5" /> {exporting ? '导出中...' : '导出 CSV'}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={exporting}
+            onClick={async () => {
+              setExporting(true);
+              try {
+                await auditApi.exportAudit({ format: 'json', case_id: keyword || undefined });
+                toast('审计包 JSON 导出成功', 'success');
+              } catch (e) {
+                toast((e as { message?: string })?.message || '导出失败（需要 audit:export 权限）', 'error');
+              } finally {
+                setExporting(false);
+              }
+            }}
+          >
+            <Download className="w-3.5 h-3.5" /> {exporting ? '导出中...' : '导出 JSON'}
+          </Button>
         </div>
       </div>
 
@@ -146,7 +177,15 @@ export function AuditPage() {
                     </td>
                   </tr>
                 ))}
-                {(!logs?.items || logs.items.length === 0) && (
+                {isError && (
+                  <tr>
+                    <td colSpan={7} className="px-4 py-8 text-center">
+                      <div className="text-danger-600 text-sm mb-2">审计日志加载失败</div>
+                      <button onClick={() => refetch()} className="text-xs text-brand-600 hover:underline">重试</button>
+                    </td>
+                  </tr>
+                )}
+                {!isError && !isLoading && (!logs?.items || logs.items.length === 0) && (
                   <tr>
                     <td colSpan={7} className="px-4 py-8 text-center text-ink-400">
                       暂无审计日志
@@ -158,6 +197,26 @@ export function AuditPage() {
           </div>
         </CardBody>
       </Card>
+
+      {/* 分页 */}
+      {logs && logs.total > PAGE_SIZE && (
+        <div className="flex items-center justify-center gap-2">
+          <Button variant="outline" size="sm" onClick={() => setPage((p) => Math.max(1, p - 1))} disabled={page === 1}>
+            上一页
+          </Button>
+          <span className="text-sm text-ink-500">
+            第 {page} 页 / 共 {Math.ceil(logs.total / PAGE_SIZE)} 页
+          </span>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setPage((p) => p + 1)}
+            disabled={page * PAGE_SIZE >= logs.total}
+          >
+            下一页
+          </Button>
+        </div>
+      )}
     </div>
   );
 }

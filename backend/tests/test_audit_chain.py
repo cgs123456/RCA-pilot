@@ -20,7 +20,6 @@ from shared.audit import (
 )
 from shared.schemas import AuditLogCreate
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -30,7 +29,7 @@ class TestHashPayload:
     def test_deterministic_same_input(self):
         """相同输入应产生相同 hash"""
         args = {
-            "prev_hash": "0" * 40,
+            "prev_hash": "0" * 64,
             "seq": 1,
             "operator": "tester",
             "action": "TEST",
@@ -46,21 +45,21 @@ class TestHashPayload:
 
     def test_different_seq_different_hash(self):
         """seq 变化 → hash 变化"""
-        h1 = _hash_payload("0" * 40, 1, "u", "ACT", None, None, "ts", [])
-        h2 = _hash_payload("0" * 40, 2, "u", "ACT", None, None, "ts", [])
+        h1 = _hash_payload("0" * 64, 1, "u", "ACT", None, None, "ts", [])
+        h2 = _hash_payload("0" * 64, 2, "u", "ACT", None, None, "ts", [])
         assert h1 != h2
 
     def test_evidence_refs_order_sensitive(self):
         """evidence_refs 顺序敏感（sort_keys 后 list 顺序固定）"""
-        h1 = _hash_payload("0" * 40, 1, "u", "ACT", None, None, "ts", ["A", "B"])
-        h2 = _hash_payload("0" * 40, 1, "u", "ACT", None, None, "ts", ["B", "A"])
+        h1 = _hash_payload("0" * 64, 1, "u", "ACT", None, None, "ts", ["A", "B"])
+        h2 = _hash_payload("0" * 64, 1, "u", "ACT", None, None, "ts", ["B", "A"])
         assert h1 != h2, "evidence_refs 顺序应影响 hash"
 
     def test_none_target_treated_as_empty(self):
         """target=None 等同 target=''"""
-        h1 = _hash_payload("0" * 40, 1, "u", "ACT", None, None, "ts", [])
-        h2 = _hash_payload("0" * 40, 1, "u", "ACT", "", None, "ts", [])
-        h3 = _hash_payload("0" * 40, 1, "u", "ACT", "", "", "ts", [])
+        h1 = _hash_payload("0" * 64, 1, "u", "ACT", None, None, "ts", [])
+        h2 = _hash_payload("0" * 64, 1, "u", "ACT", "", None, "ts", [])
+        h3 = _hash_payload("0" * 64, 1, "u", "ACT", "", "", "ts", [])
         assert h1 == h2 == h3
 
 
@@ -79,7 +78,7 @@ class TestAppendAuditLog:
         await test_db.commit()
 
         assert log.seq == 1
-        assert log.prev_hash == "0" * 40
+        assert log.prev_hash == "0" * 64
         assert log.current_hash.startswith("sha256:")
         assert log.log_id.startswith("LOG-")
 
@@ -105,7 +104,7 @@ class TestAppendAuditLog:
         assert log1.seq == 1
         assert log2.seq == 2
         assert log3.seq == 3
-        assert log1.prev_hash == "0" * 40
+        assert log1.prev_hash == "0" * 64
         assert log2.prev_hash == log1.current_hash
         assert log3.prev_hash == log2.current_hash
 
@@ -160,17 +159,18 @@ class TestVerifyHashChain:
 
     async def test_verify_detects_tampered_detail(self, test_db: AsyncSession):
         """篡改 detail 字段后 verify 返回 False"""
-        log1 = await append_audit_log(
+        await append_audit_log(
             test_db, operator="u1", action="A1", detail="原始详情"
         )
         await test_db.flush()
-        log2 = await append_audit_log(
+        await append_audit_log(
             test_db, operator="u2", action="A2", detail="第二条"
         )
         await test_db.commit()
 
         # 直接修改 DB（绕过应用层）—— 模拟 DBA 篡改
         from sqlalchemy import update
+
         from shared.models import AuditLog
 
         await test_db.execute(
@@ -191,17 +191,18 @@ class TestVerifyHashChain:
 
     async def test_verify_detects_broken_link(self, test_db: AsyncSession):
         """prev_hash 链断裂应被检测到"""
-        log1 = await append_audit_log(
+        await append_audit_log(
             test_db, operator="u1", action="A1", detail="d1"
         )
         await test_db.flush()
-        log2 = await append_audit_log(
+        await append_audit_log(
             test_db, operator="u2", action="A2", detail="d2"
         )
         await test_db.commit()
 
         # 篡改 log2 的 prev_hash 使链断裂
         from sqlalchemy import update
+
         from shared.models import AuditLog
 
         await test_db.execute(
@@ -213,3 +214,25 @@ class TestVerifyHashChain:
 
         valid = await verify_hash_chain(test_db)
         assert valid is False
+
+    async def test_concurrent_append_same_prev_hash(self, test_db: AsyncSession):
+        """并发追加：多个任务同时写入应按顺序排队，seq 单调递增"""
+        import asyncio
+
+        async def _append(i: int):
+            return await append_audit_log(
+                test_db, operator=f"u{i}", action="CONC", target="conc", detail=f"detail-{i}"
+            )
+
+        # 同时发起 5 个并发写入
+        tasks = [_append(i) for i in range(5)]
+        results = await asyncio.gather(*tasks)
+        await test_db.commit()
+
+        # 检查 seq 是否单调递增（1, 2, 3, 4, 5），无重复无跳跃
+        seqs = sorted([r.seq for r in results])
+        assert seqs == [1, 2, 3, 4, 5], f"并发 seq 应单调递增，得到 {seqs}"
+
+        # 检查 hash 链是否完整
+        valid = await verify_hash_chain(test_db)
+        assert valid is True

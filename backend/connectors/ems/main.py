@@ -5,8 +5,8 @@ import os
 
 import uvicorn
 
-from shared.service_base import create_app
 from connectors.ems.routes import router
+from shared.service_base import create_app
 
 app = create_app("ems-connector", version="1.0.0")
 app.include_router(router, prefix="/api/v1")

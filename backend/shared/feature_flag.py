@@ -18,17 +18,17 @@ from __future__ import annotations
 
 import json
 import os
+import copy  # noqa: F401
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 from .config import settings
-
 
 # ============================================================
 # 默认 flag 配置（本地模式）
 # ============================================================
-DEFAULT_FLAGS: Dict[str, Dict[str, Any]] = {
+DEFAULT_FLAGS: dict[str, dict[str, Any]] = {
     # Skeptic v2 增强版 —— 更激进的挑战策略
     "skeptic_v2_enhanced": {
         "enabled": False,  # 默认关闭，灰度开启
@@ -82,12 +82,14 @@ DEFAULT_FLAGS: Dict[str, Dict[str, Any]] = {
 
 
 @lru_cache
-def _load_flags() -> Dict[str, Dict[str, Any]]:
+def _load_flags() -> dict[str, dict[str, Any]]:
     """加载 flag 配置
 
     优先级：环境变量 RCA_FEATURE_FLAGS > 配置文件 > DEFAULT_FLAGS
+    必须深拷贝 DEFAULT_FLAGS —— 浅拷贝会让 env/file 覆盖就地污染默认值，
+    导致 reload_flags 后灰度百分比回滚失效。
     """
-    flags = DEFAULT_FLAGS.copy()
+    flags = copy.deepcopy(DEFAULT_FLAGS)
 
     # 从环境变量加载（JSON 字符串）
     env_flags = os.getenv("RCA_FEATURE_FLAGS")
@@ -126,10 +128,33 @@ def _hash_user_id(user_id: str) -> int:
     return int(h[:8], 16) % 100
 
 
+# Unleash 客户端进程级单例 —— 旧实现每次 is_enabled 都新建客户端并同步
+# initialize_client()（阻塞事件循环 + 连接泄漏）
+_unleash_client: Any | None = None
+_unleash_failed: bool = False
+
+
+def _get_unleash_client() -> Any | None:
+    """懒初始化 Unleash 客户端单例；失败后不再反复重试（降级本地配置）"""
+    global _unleash_client, _unleash_failed
+    if _unleash_client is not None or _unleash_failed:
+        return _unleash_client
+    try:
+        from UnleashClient import UnleashClient
+
+        client = UnleashClient(url=settings.unleash_url, app_name="rca-pilot")
+        client.initialize_client()
+        _unleash_client = client
+        return _unleash_client
+    except Exception:
+        _unleash_failed = True
+        return None
+
+
 def is_enabled(
     flag_name: str,
     *,
-    user_id: Optional[str] = None,
+    user_id: str | None = None,
     default: bool = False,
 ) -> bool:
     """判断 feature flag 是否启用
@@ -144,16 +169,14 @@ def is_enabled(
     """
     # 优先尝试 Unleash 远程（如果配置了）
     if settings.unleash_url:
-        try:
-            from UnleashClient import UnleashClient
-
-            client = UnleashClient(url=settings.unleash_url, app_name="rca-pilot")
-            client.initialize_client()
-            context = {"userId": user_id} if user_id else {}
-            return client.is_enabled(flag_name, context=context)
-        except Exception:
-            # Unleash 不可用时降级到本地配置
-            pass
+        client = _get_unleash_client()
+        if client is not None:
+            try:
+                context = {"userId": user_id} if user_id else {}
+                return client.is_enabled(flag_name, context=context)
+            except Exception:
+                # Unleash 判定异常时降级到本地配置
+                pass
 
     # 本地配置模式
     flags = _load_flags()
@@ -166,6 +189,9 @@ def is_enabled(
 
     # 百分比灰度
     rollout = flag.get("rollout_percentage", 100)
+    # 验证 rollout_percentage 合法性（0-100）
+    if not isinstance(rollout, (int, float)) or rollout < 0 or rollout > 100:
+        raise ValueError(f"Feature flag {flag_name} rollout_percentage 必须为 0-100 之间的数值，当前值: {rollout}")
     if rollout >= 100:
         return True
     if rollout <= 0:
@@ -176,13 +202,13 @@ def is_enabled(
     return _hash_user_id(user_id) < rollout
 
 
-def flag_context(flag_name: str) -> Dict[str, Any]:
+def flag_context(flag_name: str) -> dict[str, Any]:
     """获取 flag 的完整上下文（用于审计/调试）"""
     flags = _load_flags()
     return flags.get(flag_name, {})
 
 
-def list_flags() -> Dict[str, Dict[str, Any]]:
+def list_flags() -> dict[str, dict[str, Any]]:
     """列出所有 flag（管理端用）"""
     return _load_flags()
 

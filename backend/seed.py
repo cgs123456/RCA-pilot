@@ -11,13 +11,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import asyncpg
 
 from shared.config import settings
-
 
 # ============================================================
 #  数据定义
@@ -270,9 +269,44 @@ async def seed_database():
         await conn.execute(schema_sql)
 
         # 2. 清空旧数据（保留表结构）
+        # GxP: audit_log 与 signatures 受防篡改触发器保护（含 TRUNCATE），默认保留。
+        # 仅当显式设置 SEED_RESET_AUDIT=1 时，用 session_replication_role=replica
+        # 这一受控运维操作绕过触发器清空 —— 该操作会被明确记录。
+        import os
+        reset_audit = os.getenv("SEED_RESET_AUDIT", "") == "1"
         print("[seed] 清空旧数据...")
-        for table in ["signatures","agent_runs","skeptic_challenges","five_whys","timeline_events","evidence","audit_log","deviations","source_systems","users"]:
+        for table in ["agent_runs", "skeptic_challenges", "five_whys", "timeline_events", "evidence", "deviations", "source_systems", "users"]:
             await conn.execute(f'TRUNCATE TABLE {table} RESTART IDENTITY CASCADE')
+        if reset_audit:
+            print("[seed] SEED_RESET_AUDIT=1 — 受控清空 audit_log/signatures（GxP 敏感操作）")
+            # session_replication_role=replica 对 BEFORE TRUNCATE 触发器无效，改用显式卸除/重建
+            await conn.execute("DROP TRIGGER IF EXISTS trg_audit_log_no_truncate ON audit_log")
+            await conn.execute("DROP TRIGGER IF EXISTS trg_signatures_no_truncate ON signatures")
+            await conn.execute('TRUNCATE TABLE audit_log RESTART IDENTITY CASCADE')
+            await conn.execute('TRUNCATE TABLE signatures RESTART IDENTITY CASCADE')
+            # 重新创建防篡改触发器，确保 GxP 合规性得以延续
+            await conn.execute("""
+                CREATE OR REPLACE FUNCTION audit_log_no_truncate_guard() RETURNS trigger AS $$
+                BEGIN
+                    RAISE EXCEPTION 'audit_log 表受 GxP 合规保护，禁止 TRUNCATE 操作';
+                END;
+                $$ LANGUAGE plpgsql;
+            """)
+            await conn.execute("""
+                CREATE OR REPLACE FUNCTION signatures_immutable_guard() RETURNS trigger AS $$
+                BEGIN
+                    RAISE EXCEPTION 'signatures 表受 21 CFR Part 11 保护，禁止 TRUNCATE 操作';
+                END;
+                $$ LANGUAGE plpgsql;
+            """)
+            await conn.execute("""
+                CREATE TRIGGER trg_audit_log_no_truncate BEFORE TRUNCATE ON audit_log FOR STATEMENT EXECUTE FUNCTION audit_log_no_truncate_guard()
+            """)
+            await conn.execute("""
+                CREATE TRIGGER trg_signatures_no_truncate BEFORE TRUNCATE ON signatures FOR STATEMENT EXECUTE FUNCTION signatures_immutable_guard()
+            """)
+        else:
+            print("[seed] 保留 audit_log/signatures（审计与签名连续性）；如需重建请设置 SEED_RESET_AUDIT=1")
 
         # 3. 加载用户（含密码 hash）
         from shared.security import hash_password
@@ -356,7 +390,7 @@ async def seed_database():
         ]
         prev_hash = "0" * 40
         for i, log in enumerate(initial_logs, 1):
-            now_iso = datetime.now(timezone.utc).isoformat()
+            now_iso = datetime.now(UTC).isoformat()
             parts = [prev_hash, str(i), log["operator"], log["action"], log["target"], log["detail"], now_iso, json.dumps(log["evidence_refs"])]
             current_hash = "sha256:" + hashlib.sha256("|".join(parts).encode()).hexdigest()
             log_id = f"LOG-INIT-{i:04d}"

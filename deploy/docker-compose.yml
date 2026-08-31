@@ -1,4 +1,4 @@
-# RCA Pilot — Docker Compose 单机部署
+# RCA Pilot — Docker Compose 单机部署（镜像版）
 # 用法：
 #   1. cp .env.example .env  修改配置
 #   2. docker compose up -d
@@ -7,7 +7,36 @@
 # 首次启动后初始化数据库：
 #   docker compose --profile seed up seed
 #
-# 注意：Docker Compose v2+ 已废弃 version 字段，此处不再声明。
+# 本地开发（挂载源码热更新）：
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+#
+# CD 部署（拉取 CI 构建的镜像）：
+#   RCA_IMAGE_TAG=<git-sha> docker compose pull && RCA_IMAGE_TAG=<git-sha> docker compose up -d
+#
+# 注意：
+# - 本文件不含源码 bind-mount（镜像即交付物，GxP 版本可追溯）；开发挂载见 docker-compose.dev.yml
+# - Postgres/Redis 不发布端口到宿主机（仅容器网络内访问）
+
+x-backend-base: &backend-base
+  restart: unless-stopped
+  env_file: .env
+  working_dir: /app
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD-SHELL", "python -c \"import os,urllib.request;urllib.request.urlopen(f'http://localhost:{os.environ['APP_PORT']}/health', timeout=3)\""]
+    interval: 15s
+    timeout: 5s
+    retries: 5
+    start_period: 20s
+  logging:
+    driver: json-file
+    options:
+      max-size: "50m"
+      max-file: "5"
 
 services:
   # ============================================================
@@ -21,8 +50,10 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-rca}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rca-secret}
       POSTGRES_DB: ${POSTGRES_DB:-rca_pilot}
-    ports:
-      - "5432:5432"
+    # 提高连接上限（9 个后端进程共享此实例）
+    command: ["postgres", "-c", "max_connections=200"]
+    expose:
+      - "5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ../backend/db/01_schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
@@ -31,13 +62,19 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
 
   redis:
     image: redis:7-alpine
     container_name: rca-redis
     restart: unless-stopped
-    ports:
-      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    expose:
+      - "6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -45,142 +82,208 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
 
   # ============================================================
   # 后端微服务
   # ============================================================
   auth-service:
+    <<: *backend-base
     build:
       context: ..
       dockerfile: deploy/Dockerfile.backend
+    image: ${RCA_REGISTRY:-rca-pilot}/auth-service:${RCA_IMAGE_TAG:-dev}
     container_name: rca-auth
-    restart: unless-stopped
-    env_file: .env
     environment:
       SERVICE_NAME: auth-service
-    command: uvicorn auth_service.main:app --host 0.0.0.0 --port 8001
-    ports:
-      - "8001:8001"
+      APP_PORT: "8001"
+    command: uvicorn auth_service.main:app --host 0.0.0.0 --port 8001 --proxy-headers
+    expose:
+      - "8001"
+
+  case-service:
+    <<: *backend-base
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    image: ${RCA_REGISTRY:-rca-pilot}/case-service:${RCA_IMAGE_TAG:-dev}
+    container_name: rca-case
+    environment:
+      SERVICE_NAME: case-service
+      APP_PORT: "8002"
+    command: uvicorn case_service.main:app --host 0.0.0.0 --port 8002 --proxy-headers
+    expose:
+      - "8002"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
-    volumes:
-      - ../backend:/app/backend
-    working_dir: /app
-
-  case-service:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile.backend
-    container_name: rca-case
-    restart: unless-stopped
-    env_file: .env
-    environment:
-      SERVICE_NAME: case-service
-    command: uvicorn case_service.main:app --host 0.0.0.0 --port 8002
-    ports:
-      - "8002:8002"
-    depends_on:
-      postgres:
-        condition: service_healthy
       auth-service:
         condition: service_started
-    volumes:
-      - ../backend:/app/backend
-    working_dir: /app
 
   evidence-service:
+    <<: *backend-base
     build:
       context: ..
       dockerfile: deploy/Dockerfile.backend
+    image: ${RCA_REGISTRY:-rca-pilot}/evidence-service:${RCA_IMAGE_TAG:-dev}
     container_name: rca-evidence
-    restart: unless-stopped
-    env_file: .env
     environment:
       SERVICE_NAME: evidence-service
-    command: uvicorn evidence_service.main:app --host 0.0.0.0 --port 8003
-    ports:
-      - "8003:8003"
-    depends_on:
-      postgres:
-        condition: service_healthy
-    volumes:
-      - ../backend:/app/backend
-    working_dir: /app
+      APP_PORT: "8003"
+    command: uvicorn evidence_service.main:app --host 0.0.0.0 --port 8003 --proxy-headers
+    expose:
+      - "8003"
 
   agent-service:
+    <<: *backend-base
     build:
       context: ..
       dockerfile: deploy/Dockerfile.backend
+    image: ${RCA_REGISTRY:-rca-pilot}/agent-service:${RCA_IMAGE_TAG:-dev}
     container_name: rca-agent
-    restart: unless-stopped
-    env_file: .env
     environment:
       SERVICE_NAME: agent-service
-    command: uvicorn agent_service.main:app --host 0.0.0.0 --port 8004
-    ports:
-      - "8004:8004"
-    depends_on:
-      postgres:
-        condition: service_healthy
-    volumes:
-      - ../backend:/app/backend
-    working_dir: /app
+      APP_PORT: "8004"
+    # agent-service 保持单 worker：BackgroundTasks 流水线与 pause/resume
+    # 状态在进程内，多 worker 会导致控制端点与执行任务分离
+    command: uvicorn agent_service.main:app --host 0.0.0.0 --port 8004 --proxy-headers
+    expose:
+      - "8004"
 
   audit-service:
+    <<: *backend-base
     build:
       context: ..
       dockerfile: deploy/Dockerfile.backend
+    image: ${RCA_REGISTRY:-rca-pilot}/audit-service:${RCA_IMAGE_TAG:-dev}
     container_name: rca-audit
-    restart: unless-stopped
-    env_file: .env
     environment:
       SERVICE_NAME: audit-service
-    command: uvicorn audit_service.main:app --host 0.0.0.0 --port 8005
-    ports:
-      - "8005:8005"
-    depends_on:
-      postgres:
-        condition: service_healthy
-    volumes:
-      - ../backend:/app/backend
-    working_dir: /app
+      APP_PORT: "8005"
+    command: uvicorn audit_service.main:app --host 0.0.0.0 --port 8005 --proxy-headers
+    expose:
+      - "8005"
 
+  # ============================================================
+  # Connectors（4 个 —— BMS/EMS/MES 缺失会导致证据拉取失败）
+  # ============================================================
   lms-connector:
+    <<: *backend-base
     build:
       context: ..
       dockerfile: deploy/Dockerfile.backend
+    image: ${RCA_REGISTRY:-rca-pilot}/lms-connector:${RCA_IMAGE_TAG:-dev}
     container_name: rca-lms-connector
-    restart: unless-stopped
-    env_file: .env
     environment:
       SERVICE_NAME: lms-connector
+      APP_PORT: "8011"
     command: uvicorn connectors.lms.main:app --host 0.0.0.0 --port 8011
-    ports:
-      - "8011:8011"
-    volumes:
-      - ../backend:/app/backend
-    working_dir: /app
+    expose:
+      - "8011"
+
+  bms-connector:
+    <<: *backend-base
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    image: ${RCA_REGISTRY:-rca-pilot}/bms-connector:${RCA_IMAGE_TAG:-dev}
+    container_name: rca-bms-connector
+    environment:
+      SERVICE_NAME: bms-connector
+      APP_PORT: "8012"
+    command: uvicorn connectors.bms.main:app --host 0.0.0.0 --port 8012
+    expose:
+      - "8012"
+
+  ems-connector:
+    <<: *backend-base
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    image: ${RCA_REGISTRY:-rca-pilot}/ems-connector:${RCA_IMAGE_TAG:-dev}
+    container_name: rca-ems-connector
+    environment:
+      SERVICE_NAME: ems-connector
+      APP_PORT: "8013"
+    command: uvicorn connectors.ems.main:app --host 0.0.0.0 --port 8013
+    expose:
+      - "8013"
+
+  mes-connector:
+    <<: *backend-base
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    image: ${RCA_REGISTRY:-rca-pilot}/mes-connector:${RCA_IMAGE_TAG:-dev}
+    container_name: rca-mes-connector
+    environment:
+      SERVICE_NAME: mes-connector
+      APP_PORT: "8014"
+    command: uvicorn connectors.mes.main:app --host 0.0.0.0 --port 8014
+    expose:
+      - "8014"
 
   # ============================================================
-  # 前端
+  # 前端（nginx 反代 + 静态资源，非 root 镜像监听 8080）
   # ============================================================
   frontend:
     build:
       context: ..
       dockerfile: deploy/Dockerfile.frontend
+    image: ${RCA_REGISTRY:-rca-pilot}/frontend:${RCA_IMAGE_TAG:-dev}
     container_name: rca-frontend
     restart: unless-stopped
     ports:
-      - "8080:80"
+      - "8080:8080"
     depends_on:
       - auth-service
       - case-service
       - evidence-service
       - agent-service
       - audit-service
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  # ============================================================
+  # 数据库备份（GxP: 数据保留 10 年 —— 每日 pg_dump 落盘）
+  # ============================================================
+  db-backup:
+    image: postgres:15-alpine
+    container_name: rca-db-backup
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-rca-secret}
+    volumes:
+      - ./backups:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: >
+      sh -c '
+        while true; do
+          TS=$$(date +%Y%m%dT%H%M%SZ);
+          echo "[backup] $$TS dumping $$POSTGRES_DB";
+          pg_dump -h postgres -U ${POSTGRES_USER:-rca} -d ${POSTGRES_DB:-rca_pilot} -F c -f /backups/rca_pilot_$$TS.dump \
+            && echo "[backup] $$TS done" || echo "[backup] $$TS FAILED";
+          find /backups -name "*.dump" -mtime +${BACKUP_RETENTION_DAYS:-30} -delete;
+          sleep 86400;
+        done'
+    profiles: ["backup"]  # 按需启用：docker compose --profile backup up -d db-backup
 
   # ============================================================
   # 数据库初始化（一次性运行）
@@ -189,18 +292,17 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile.backend
+    image: ${RCA_REGISTRY:-rca-pilot}/seed:${RCA_IMAGE_TAG:-dev}
     container_name: rca-seed
     env_file: .env
     environment:
       SERVICE_NAME: seed
     command: python -m backend.seed
+    working_dir: /app
     depends_on:
       postgres:
         condition: service_healthy
-    volumes:
-      - ../backend:/app/backend
-    working_dir: /app
-    profiles: ["seed"]  # 仅在 docker-compose --profile seed up 时运行
+    profiles: ["seed"]  # 仅在 docker compose --profile seed up 时运行
 
 volumes:
   postgres_data:

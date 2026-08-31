@@ -13,7 +13,6 @@ from __future__ import annotations
 import pytest
 from httpx import AsyncClient
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -55,7 +54,7 @@ class TestLogin:
 
     async def test_login_locks_after_5_failures(self, app_client: AsyncClient):
         """连续 5 次失败后锁定账号"""
-        for i in range(5):
+        for _i in range(5):
             resp = await app_client.post(
                 "/api/v1/auth/login",
                 json={"email": "lisa.chen@biopharma.com", "password": "wrong-password"},

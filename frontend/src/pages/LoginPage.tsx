@@ -7,17 +7,20 @@ import { Activity, Lock, Mail, AlertCircle, ShieldCheck } from 'lucide-react';
 import { useAuthStore } from '@/stores/auth.store';
 import { Button } from '@/components/ui/Button';
 
-const DEMO_ACCOUNTS = [
-  { label: '调查员 (Lisa Chen)', email: 'lisa.chen@biopharma.com', password: 'rca-demo-2025' },
-  { label: 'QA 审核员 (James Wilson)', email: 'james.wilson@biopharma.com', password: 'rca-demo-2025' },
-  { label: '管理员', email: 'admin@biopharma.com', password: 'rca-admin-2025' },
-];
+// 演示账号仅在 dev 构建存在 —— 生产 bundle 不得包含任何口令（审计发现项）
+const DEMO_ACCOUNTS: { label: string; email: string; password: string }[] = import.meta.env.DEV
+  ? [
+      { label: '调查员 (Lisa Chen)', email: 'lisa.chen@biopharma.com', password: 'rca-demo-2025' },
+      { label: 'QA 审核员 (James Wilson)', email: 'james.wilson@biopharma.com', password: 'rca-demo-2025' },
+      { label: '管理员', email: 'admin@biopharma.com', password: 'rca-admin-2025' },
+    ]
+  : [];
 
 export function LoginPage() {
   const navigate = useNavigate();
   const { login } = useAuthStore();
-  const [email, setEmail] = useState('lisa.chen@biopharma.com');
-  const [password, setPassword] = useState('rca-demo-2025');
+  const [email, setEmail] = useState(import.meta.env.DEV ? 'lisa.chen@biopharma.com' : '');
+  const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -28,8 +31,8 @@ export function LoginPage() {
     try {
       await login(email, password);
       navigate('/dashboard');
-    } catch (err: any) {
-      setError(err.message || '登录失败');
+    } catch (err) {
+      setError((err as { message?: string })?.message || '登录失败');
     } finally {
       setLoading(false);
     }
@@ -128,6 +131,7 @@ export function LoginPage() {
             </Button>
           </form>
 
+          {DEMO_ACCOUNTS.length > 0 && (
           <div className="mt-8 pt-6 border-t border-ink-200">
             <div className="text-xs text-ink-500 mb-3">演示账号（点击快速填充）</div>
             <div className="space-y-1.5">
@@ -147,6 +151,7 @@ export function LoginPage() {
               ))}
             </div>
           </div>
+          )}
         </div>
       </div>
     </div>
