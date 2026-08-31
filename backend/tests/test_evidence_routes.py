@@ -143,6 +143,7 @@ async def evidence_env(test_db: AsyncSession, seed_db) -> dict:
             case_id="DEV-LIST-A",
             source_system="LMS",
             collected_at=datetime(2025, 8, 14, 10, 0, tzinfo=UTC),
+            created_at=datetime(2025, 8, 14, 10, 0, tzinfo=UTC),  # 最新，保证 created_at desc 顺序确定
             summary="EMP-2187 更衣资质逾期",
             raw_data={"employee_id": "EMP-2187"},
             content_hash="sha256:list-1",
@@ -153,6 +154,7 @@ async def evidence_env(test_db: AsyncSession, seed_db) -> dict:
             case_id="DEV-LIST-A",
             source_system="BMS",
             collected_at=datetime(2025, 8, 13, 9, 0, tzinfo=UTC),
+            created_at=datetime(2025, 8, 13, 9, 0, tzinfo=UTC),
             summary="AHU-7 差压 470 Pa 超过预警值",
             raw_data={"ahu_id": "AHU-7"},
             content_hash="sha256:list-2",
@@ -163,6 +165,7 @@ async def evidence_env(test_db: AsyncSession, seed_db) -> dict:
             case_id="DEV-LIST-B",
             source_system="EMS",
             collected_at=datetime(2025, 8, 12, 8, 0, tzinfo=UTC),
+            created_at=datetime(2025, 8, 12, 8, 0, tzinfo=UTC),
             summary="Room-3B 沉降菌 22 CFU 超标",
             raw_data={"point_id": "Room-3B"},
             content_hash="sha256:list-3",
