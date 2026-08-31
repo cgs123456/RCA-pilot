@@ -33,7 +33,7 @@ bcrypt==4.2.0
 # ============================================================
 # 可观测性
 # ============================================================
-python-json-logger==2.0.7
+python-json-logger==4.2.0
 prometheus-client==0.21.0   # Prometheus metrics
 slowapi==0.1.9              # 限流（令牌桶）
 sentry-sdk[fastapi]==2.18.0  # 异常捕捉
