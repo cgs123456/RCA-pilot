@@ -1,14 +1,12 @@
-"""Alembic 迁移环境 — 异步 + 自动从 ORM 模型生成迁移"""
+"""Alembic 迁移环境 — 同步驱动（psycopg2）+ 自动从 ORM 模型生成迁移"""
 from __future__ import annotations
 
-import asyncio
 import sys
 from logging.config import fileConfig
 from pathlib import Path
 
 from sqlalchemy import pool
-from sqlalchemy.engine import Connection
-from sqlalchemy.ext.asyncio import async_engine_from_config
+from sqlalchemy.engine import Connection, create_engine
 
 from alembic import context
 
@@ -72,25 +70,18 @@ def do_run_migrations(connection: Connection) -> None:
         context.run_migrations()
 
 
-async def run_migrations_online_async() -> None:
-    """在线异步模式 —— 实际连接 DB 执行迁移"""
-    configuration = config.get_section(config.config_ini_section, {})
-    configuration["sqlalchemy.url"] = settings.postgres_dsn
-    connectable = async_engine_from_config(
-        configuration,
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
-    )
-
-    async with connectable.connect() as connection:
-        await connection.run_sync(do_run_migrations)
-
-    await connectable.dispose()
-
-
 def run_migrations_online() -> None:
-    """在线模式入口 —— 包装异步调用"""
-    asyncio.run(run_migrations_online_async())
+    """在线模式 —— 用同步驱动（psycopg2）执行迁移
+
+    必须同步执行：迁移脚本里有 op.execute 多语句 DDL（CREATE FUNCTION + CREATE
+    TRIGGER），asyncpg 不允许单条 prepared statement 含多条命令，故不能用异步引擎。
+    """
+    connectable = create_engine(sync_url, poolclass=pool.NullPool)
+
+    with connectable.connect() as connection:
+        do_run_migrations(connection)
+
+    connectable.dispose()
 
 
 if context.is_offline_mode():
