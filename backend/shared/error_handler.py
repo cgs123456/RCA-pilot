@@ -139,7 +139,7 @@ def register_exception_handlers(app: FastAPI) -> None:
             except ValueError:
                 code = None
             else:
-                return _error_response(code, str(exc), detail=getattr(exc, "details", None))
+                return _error_response(ErrorCode(exc_error_code), str(exc), detail=getattr(exc, "details", None))
 
         # 2. 类 → 错误码注册表
         code = _RCA_ERROR_CODE_MAP.get(type(exc))
@@ -154,7 +154,7 @@ def register_exception_handlers(app: FastAPI) -> None:
         return _error_response(
             ErrorCode.VALIDATION_ERROR,
             "请求参数校验失败",
-            detail=_sanitize_validation_errors(exc.errors()),
+            detail=_sanitize_validation_errors(list(exc.errors())),
         )
 
     @app.exception_handler(PermissionError)

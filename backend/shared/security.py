@@ -5,7 +5,7 @@ import hashlib
 import hmac
 import secrets
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import bcrypt
 import jwt
@@ -130,7 +130,7 @@ def decode_token(token: str, expected_type: Literal["access", "refresh"] = "acce
             f"Token 类型错误，期望 {expected_type}",
             error_code=ErrorCode.TOKEN_INVALID.value,
         )
-    return payload
+    return cast(dict[str, Any], payload)
 
 
 # ---- RBAC ----
@@ -220,7 +220,7 @@ async def revoke_jti(jti: str, ttl_seconds: int) -> bool:
     if redis is None:
         return False
     try:
-        await redis.setex(f"rca:jti_revoked:{jti}", ttl_seconds, "1")
+        await redis.setex(f"rca:jti_revoked:{jti}", ttl_seconds, "1")  # type: ignore[attr-defined]
         return True
     except Exception:
         return False
@@ -236,6 +236,6 @@ async def is_jti_revoked(jti: str) -> bool:
     if redis is None:
         return False
     try:
-        return bool(await redis.exists(f"rca:jti_revoked:{jti}"))
+        return bool(await redis.exists(f"rca:jti_revoked:{jti}"))  # type: ignore[attr-defined]
     except Exception:
         return False

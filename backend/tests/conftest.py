@@ -55,14 +55,14 @@ class _ARRAYCompat(JSON):
         super().__init__(*args, **kwargs)
 
 # Monkey-patch —— 必须在 import shared.models 之前
-pg_dialect.JSONB = _JSONBCompat
-pg_dialect.ARRAY = _ARRAYCompat
+pg_dialect.JSONB = _JSONBCompat  # type: ignore[assignment,misc]
+pg_dialect.ARRAY = _ARRAYCompat  # type: ignore[assignment,misc]
 
 # 同时 patch sqlalchemy.dialects.postgresql 模块中的引用
 import sqlalchemy as _sa
 
-_sa.dialects.postgresql.JSONB = _JSONBCompat
-_sa.dialects.postgresql.ARRAY = _ARRAYCompat
+_sa.dialects.postgresql.JSONB = _JSONBCompat  # type: ignore[assignment,misc]
+_sa.dialects.postgresql.ARRAY = _ARRAYCompat  # type: ignore[assignment,misc]
 
 from shared.database import Base, get_db
 from shared.models import User
@@ -221,7 +221,7 @@ async def case_app_client(test_engine, seed_db):
             session_id="test-session",
             ip_address="127.0.0.1",
             permissions={"case:read", "case:write", "hitl:accept", "sign:approve"},
-            db=db if isinstance(db, AsyncSession) else None,
+            db=db if isinstance(db, AsyncSession) else None,  # type: ignore[arg-type]
         )
 
     app.dependency_overrides[get_db] = override_get_db
@@ -243,7 +243,7 @@ async def auth_token(app_client: AsyncClient) -> str:
         json={"email": "lisa.chen@biopharma.com", "password": "rca-demo-2025"},
     )
     assert resp.status_code == 200, f"登录失败: {resp.text}"
-    return resp.json()["access_token"]
+    return str(resp.json()["access_token"])
 
 
 @pytest.fixture

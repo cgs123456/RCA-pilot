@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
 from fastapi import APIRouter, Depends, Query
 
@@ -13,7 +14,7 @@ router = APIRouter(prefix="/bms", tags=["bms-connector"], dependencies=[Depends(
 # ============================================================
 #  Mock 数据 — 模拟 BMS 数据库（AHU HVAC 时序）
 # ============================================================
-AHUS = {
+AHUS: dict[str, Any] = {
     "AHU-7": {
         "ahu_id": "AHU-7",
         "area": "B 级区 Room-3B",

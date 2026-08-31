@@ -32,16 +32,19 @@ def _normalize_evidence_refs(ev_refs: object) -> list[str]:
     """兼容 SQLite JSON 存储返回 str 的情况"""
     if isinstance(ev_refs, str):
         try:
-            ev_refs = json.loads(ev_refs)
+            raw = json.loads(ev_refs)
         except (json.JSONDecodeError, TypeError):
-            ev_refs = []
-    return list(ev_refs or [])
+            raw = []
+        ev_refs = raw
+    if isinstance(ev_refs, list):
+        return [str(x) for x in ev_refs]
+    return []
 
 
 def _normalize_ts(created: object) -> str:
     """规范化时间戳 —— 与写入时（replace(tzinfo=None).isoformat()）一致"""
-    if hasattr(created, "isoformat"):
-        if getattr(created, "tzinfo", None) is not None:
+    if isinstance(created, datetime):
+        if created.tzinfo is not None:
             created = created.replace(tzinfo=None)
         return created.isoformat()
     return str(created)

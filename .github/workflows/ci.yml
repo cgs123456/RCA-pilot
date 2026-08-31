@@ -90,7 +90,7 @@ jobs:
           pip-audit -r backend/requirements.txt --strict
 
       - name: Trivy 文件系统扫描（含配置与 secrets）
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: .

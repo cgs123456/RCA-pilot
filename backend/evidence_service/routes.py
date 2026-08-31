@@ -415,7 +415,7 @@ async def embed_evidence_batch(
     # 按 64 条分批调用（Qwen/GLM/OpenAI 兼容接口单批上限差异较大，64 为稳妥值）
     embeddings: list[list[float]] = []
     for i in range(0, len(evidences), EMBED_BATCH_SIZE):
-        chunk = [ev.summary for ev in evidences[i:i + EMBED_BATCH_SIZE]]
+        chunk = [s for s in (ev.summary for ev in evidences[i:i + EMBED_BATCH_SIZE]) if s is not None]
         try:
             embeddings.extend(await llm_client.embed_texts(chunk))
         except LLMError as e:

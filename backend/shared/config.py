@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import Field, computed_field
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -113,7 +113,6 @@ class Settings(BaseSettings):
     prometheus_enabled: bool = True
     unleash_url: str = Field(default="", description="Unleash Feature Flag 服务地址，空则禁用灰度")
 
-    @computed_field
     @property
     def postgres_dsn(self) -> str:
         return (
@@ -121,13 +120,11 @@ class Settings(BaseSettings):
             f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
         )
 
-    @computed_field
     @property
     def redis_url(self) -> str:
         auth = f":{self.redis_password}@" if self.redis_password else ""
         return f"redis://{auth}{self.redis_host}:{self.redis_port}/{self.redis_db}"
 
-    @computed_field
     @property
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]

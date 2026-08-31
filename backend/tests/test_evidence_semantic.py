@@ -154,8 +154,10 @@ class TestVectorSearch:
 
         # 给历史案例的证据设置 embedding
         ev_hist = await test_db.get(Evidence, "E-HIST-01")
+        assert ev_hist is not None
         ev_hist.embedding = [1.0, 0.0, 0.0]  # 与查询向量相同
         ev_curr = await test_db.get(Evidence, "E-SEM-02")
+        assert ev_curr is not None
         ev_curr.embedding = [0.0, 1.0, 0.0]  # 与查询正交
         await test_db.commit()
 
@@ -178,6 +180,7 @@ class TestVectorSearch:
         # 给所有证据设置 embedding
         for ev_id in ["E-SEM-01", "E-SEM-02", "E-HIST-01", "E-HIST-02"]:
             ev = await test_db.get(Evidence, ev_id)
+            assert ev is not None
             ev.embedding = [1.0, 0.0]
         await test_db.commit()
 
@@ -259,6 +262,7 @@ class TestSearchEvidence:
         # 给证据设置 embedding
         for ev_id in ["E-SEM-02", "E-HIST-01"]:
             ev = await test_db.get(Evidence, ev_id)
+            assert ev is not None
             ev.embedding = [1.0, 0.0, 0.0]
         await test_db.commit()
 
@@ -553,8 +557,10 @@ class TestEvidenceHunterSemantic:
 
         # 给历史证据设置 embedding
         ev_hist = await test_db.get(Evidence, "E-HIST-01")
+        assert ev_hist is not None
         ev_hist.embedding = [1.0, 0.0, 0.0]
         ev_curr = await test_db.get(Evidence, "E-SEM-02")
+        assert ev_curr is not None
         ev_curr.embedding = [0.0, 1.0, 0.0]
         await test_db.commit()
 

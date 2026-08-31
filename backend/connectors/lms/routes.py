@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
 from fastapi import APIRouter, Depends, Query
 
@@ -13,7 +14,7 @@ router = APIRouter(prefix="/lms", tags=["lms-connector"], dependencies=[Depends(
 # ============================================================
 #  Mock 数据 — 模拟 LMS 数据库
 # ============================================================
-EMPLOYEES = {
+EMPLOYEES: dict[str, Any] = {
     "EMP-2156": {
         "employee_id": "EMP-2156",
         "name": "EMP-2156",

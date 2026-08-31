@@ -28,18 +28,15 @@ class TestHashPayload:
 
     def test_deterministic_same_input(self):
         """相同输入应产生相同 hash"""
-        args = {
-            "prev_hash": "0" * 64,
-            "seq": 1,
-            "operator": "tester",
-            "action": "TEST",
-            "target": "case-1",
-            "detail": "测试详情",
-            "timestamp_iso": "2025-08-17T06:00:00+00:00",
-            "evidence_refs": ["E-001", "E-002"],
-        }
-        h1 = _hash_payload(**args)
-        h2 = _hash_payload(**args)
+        # 显式位置参数传参，避免 dict[str, object] 展开与 _hash_payload 签名类型不符
+        h1 = _hash_payload(
+            "0" * 64, 1, "tester", "TEST", "case-1", "测试详情",
+            "2025-08-17T06:00:00+00:00", ["E-001", "E-002"],
+        )
+        h2 = _hash_payload(
+            "0" * 64, 1, "tester", "TEST", "case-1", "测试详情",
+            "2025-08-17T06:00:00+00:00", ["E-001", "E-002"],
+        )
         assert h1 == h2
         assert h1.startswith("sha256:")
 

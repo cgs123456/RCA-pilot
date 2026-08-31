@@ -313,7 +313,7 @@ class LLMClient:
                         f"LLM 输出被 max_tokens={payload['max_tokens']} 截断（finish_reason=length）"
                     )
 
-                return content
+                return str(content)
 
             except (httpx.TimeoutException, httpx.HTTPError) as e:
                 last_error = LLMResponseError(f"网络异常: {type(e).__name__}: {e}")

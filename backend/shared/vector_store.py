@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import cast
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -272,11 +273,12 @@ async def find_related_cases(
         key=lambda x: x["max_score"],
         reverse=True,
     )[:top_k]
+    related = cast(list[dict], related)
 
     # 清理输出
-    for r in related:
-        r["evidence_count"] = len(r["evidence_ids"])
-        r["sample_summaries"] = r["summaries"][:3]  # 只展示前 3 条证据摘要
-        del r["summaries"]
+    for item in related:
+        item["evidence_count"] = len(item["evidence_ids"])
+        item["sample_summaries"] = item["summaries"][:3]  # 只展示前 3 条证据摘要
+        del item["summaries"]
 
     return related

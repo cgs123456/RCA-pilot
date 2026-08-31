@@ -13,6 +13,7 @@ import hashlib
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import asyncpg
 
@@ -244,7 +245,7 @@ CASE_D = {
     "skeptic_challenges": [],
 }
 
-ALL_CASES = [CASE_A, CASE_B, CASE_C, CASE_D]
+ALL_CASES: list[Any] = [CASE_A, CASE_B, CASE_C, CASE_D]
 
 
 # ============================================================
@@ -392,7 +393,7 @@ async def seed_database():
         for i, log in enumerate(initial_logs, 1):
             now_iso = datetime.now(UTC).isoformat()
             parts = [prev_hash, str(i), log["operator"], log["action"], log["target"], log["detail"], now_iso, json.dumps(log["evidence_refs"])]
-            current_hash = "sha256:" + hashlib.sha256("|".join(parts).encode()).hexdigest()
+            current_hash = "sha256:" + hashlib.sha256("|".join(str(x) for x in parts).encode()).hexdigest()
             log_id = f"LOG-INIT-{i:04d}"
             await conn.execute(
                 """INSERT INTO audit_log (log_id, seq, operator, action, target, detail, evidence_refs, prev_hash, current_hash, created_at)

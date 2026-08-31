@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
 from fastapi import APIRouter, Depends, Query
 
@@ -28,7 +29,7 @@ BATCHES = {
     },
 }
 
-CLEANING_RECORDS = [
+CLEANING_RECORDS: list[Any] = [
     {
         "record_id": "WO-20250814-0401",
         "work_order": "WO-20250814-0401",

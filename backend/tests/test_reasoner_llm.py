@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 from datetime import UTC, datetime, timezone
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -346,7 +347,7 @@ class TestReasonerLLMPath:
         mock_client.model_name = "glm-4-plus-mock"
         mock_client.hash_prompt.return_value = "sha256:mock-prompt-hash"
         mock_client.chat_json = AsyncMock(return_value=type("MockOutput", (), {
-            "five_whys": [type("MockWhy", (), fw)() for fw in mock_llm_output["five_whys"]],
+            "five_whys": [type("MockWhy", (), cast(dict[str, Any], fw))() for fw in mock_llm_output["five_whys"]],
             "fishbone": type("MockFishbone", (), {
                 "model_dump": lambda self: mock_llm_output["fishbone"]
             })(),
@@ -656,7 +657,7 @@ class TestLLMReasonerSchema:
 class TestLLMClientHTTPPath:
     """LLM 客户端 HTTP 调用路径测试 — 使用 mock httpx.AsyncClient"""
 
-    def _make_mock_response(self, status_code: int = 200, content: str = "", json_body: dict = None):
+    def _make_mock_response(self, status_code: int = 200, content: str = "", json_body: dict | None = None):
         """构造 mock httpx.Response"""
         mock_resp = MagicMock()
         mock_resp.status_code = status_code

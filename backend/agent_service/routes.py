@@ -938,8 +938,8 @@ def _build_drafter_user_prompt(
         if causes:
             cause_items = []
             for c in causes:
-                ev = ", ".join(c.get("evidence", [])) if c.get("evidence") else "无证据"
-                cause_items.append(f"{c.get('text', '')} [{ev}]")
+                ev_str = ", ".join(c.get("evidence", [])) if c.get("evidence") else "无证据"
+                cause_items.append(f"{c.get('text', '')} [{ev_str}]")
             fishbone_lines.append(f"  {cat.get('name')}: {'; '.join(cause_items)}")
 
     # Skeptic 挑战
@@ -1824,6 +1824,7 @@ async def _execute_pipeline(case_id: str, run_id: str, triggered_by: str) -> Non
                 .where(Deviation.id == case_id)
             )).scalar_one_or_none()
             eh_out = await _run_evidence_hunter(db, case, flag_user=triggered_by) if case else None
+        assert eh_out is not None
         _observe_stage("evidence_hunter", eh_out or {}, time.perf_counter() - t0)
         await _write_stage_result(
             run_id, agent="evidence_hunter", states_update={"evidence_hunter": eh_out},
@@ -1844,6 +1845,7 @@ async def _execute_pipeline(case_id: str, run_id: str, triggered_by: str) -> Non
                     .where(Deviation.id == case_id)
                 )).scalar_one_or_none()
                 debate_out = await _run_reasoner_debate(db, case, eh_out, flag_user=triggered_by) if case else None
+            assert debate_out is not None
             _observe_stage("reasoner_debate", debate_out or {}, time.perf_counter() - t0)
 
             primary_out = (debate_out or {}).get("primary") or {}
@@ -1884,6 +1886,7 @@ async def _execute_pipeline(case_id: str, run_id: str, triggered_by: str) -> Non
                     await _run_skeptic_cross_examine(db, case, primary_out, adversary_out)
                     if case else None
                 )
+            assert s_out is not None
             _observe_stage("skeptic", s_out or {}, time.perf_counter() - t0)
             await _write_stage_result(
                 run_id, agent="skeptic_cross_examine", states_update={"skeptic": s_out},
@@ -1905,6 +1908,7 @@ async def _execute_pipeline(case_id: str, run_id: str, triggered_by: str) -> Non
                     await _run_meta_controller_synthesis(db, case, primary_out, adversary_out, s_out)
                     if case else None
                 )
+            assert mc_out is not None
             _observe_stage("meta_controller", mc_out or {}, time.perf_counter() - t0)
             await _write_stage_result(
                 run_id, agent="meta_controller", states_update={"meta_controller": mc_out},
@@ -1928,6 +1932,7 @@ async def _execute_pipeline(case_id: str, run_id: str, triggered_by: str) -> Non
                     await _run_drafter_debate(db, case, debate_out, s_out, mc_out)
                     if case else None
                 )
+            assert d_out is not None
             _observe_stage("drafter", d_out or {}, time.perf_counter() - t0)
             await _write_stage_result(
                 run_id, agent="drafter", states_update={"drafter": d_out},
@@ -1948,6 +1953,7 @@ async def _execute_pipeline(case_id: str, run_id: str, triggered_by: str) -> Non
                     .where(Deviation.id == case_id)
                 )).scalar_one_or_none()
                 r_out = await _run_reasoner(db, case, eh_out, flag_user=triggered_by) if case else None
+            assert r_out is not None
             _observe_stage("reasoner", r_out or {}, time.perf_counter() - t0)
             await _write_stage_result(
                 run_id, agent="reasoner", states_update={"reasoner": r_out},
@@ -1964,6 +1970,7 @@ async def _execute_pipeline(case_id: str, run_id: str, triggered_by: str) -> Non
                     select(Deviation).options(selectinload(Deviation.evidence)).where(Deviation.id == case_id)
                 )).scalar_one_or_none()
                 s_out = await _run_skeptic(db, case, r_out, flag_user=triggered_by) if case else None
+            assert s_out is not None
             _observe_stage("skeptic", s_out or {}, time.perf_counter() - t0)
             await _write_stage_result(
                 run_id, agent="skeptic", states_update={"skeptic": s_out},
@@ -1981,6 +1988,7 @@ async def _execute_pipeline(case_id: str, run_id: str, triggered_by: str) -> Non
                     select(Deviation).options(selectinload(Deviation.evidence)).where(Deviation.id == case_id)
                 )).scalar_one_or_none()
                 d_out = await _run_drafter(db, case, r_out, s_out, flag_user=triggered_by) if case else None
+            assert d_out is not None
             _observe_stage("drafter", d_out or {}, time.perf_counter() - t0)
             await _write_stage_result(
                 run_id, agent="drafter", states_update={"drafter": d_out},
@@ -2003,6 +2011,7 @@ async def _execute_pipeline(case_id: str, run_id: str, triggered_by: str) -> Non
                 .where(Deviation.id == case_id)
             )).scalar_one_or_none()
             g_out = await _run_guardian(db, case, d_out) if case else None
+        assert g_out is not None
         _observe_stage("guardian", g_out or {}, time.perf_counter() - t0)
         await _write_stage_result(
             run_id, agent="guardian", states_update={"guardian": g_out},

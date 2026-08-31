@@ -173,7 +173,7 @@ def is_enabled(
         if client is not None:
             try:
                 context = {"userId": user_id} if user_id else {}
-                return client.is_enabled(flag_name, context=context)
+                return bool(client.is_enabled(flag_name, context=context))
             except Exception:
                 # Unleash 判定异常时降级到本地配置
                 pass

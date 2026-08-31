@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from typing import cast
 
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -10,11 +11,12 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.pool import QueuePool
 
 from .config import settings
 
 engine = create_async_engine(
-    settings.postgres_dsn,
+    cast(str, settings.postgres_dsn),
     echo=settings.debug,
     pool_size=5,
     max_overflow=10,
@@ -61,12 +63,12 @@ async def db_session() -> AsyncGenerator[AsyncSession, None]:
 # 连接池统计快照（供 Prometheus 采集）
 def pool_snapshot() -> dict[str, int | float | None]:
     """获取连接池当前使用情况快照"""
-    if engine.pool is None:
-        return {"pool_size": 0, "checked_in": 0, "checked_out": 0, "overflow": 0}
     pool = engine.pool
-    return {
-        "pool_size": pool.size(),
-        "checked_in": pool.checked_in(),
-        "checked_out": pool.checked_out(),
-        "overflow": pool.overflow() if hasattr(pool, "overflow") else None,
-    }
+    if isinstance(pool, QueuePool):
+        return {
+            "pool_size": pool.size(),
+            "checked_in": pool.checkedin(),
+            "checked_out": pool.checkedout(),
+            "overflow": pool.overflow(),
+        }
+    return {"pool_size": 0, "checked_in": 0, "checked_out": 0, "overflow": 0}

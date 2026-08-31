@@ -18,6 +18,7 @@ from prometheus_client import (
     Histogram,
     generate_latest,
 )
+from sqlalchemy.pool import QueuePool
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
@@ -180,7 +181,7 @@ class MetricsMiddleware(BaseHTTPMiddleware):
         """从 request.scope 提取路由模板（如 /cases/{case_id}）"""
         route = request.scope.get("route")
         if route and hasattr(route, "path"):
-            return route.path
+            return str(route.path)
         return None
 
 
@@ -198,8 +199,9 @@ def register_metrics_endpoint(app: FastAPI, service_name: str = "") -> None:
         try:
             from shared.database import engine
             pool = engine.pool
-            DB_POOL_SIZE.labels(service=svc).set(pool.size())
-            DB_POOL_CHECKED_OUT.labels(service=svc).set(pool.checkedout())
+            if isinstance(pool, QueuePool):
+                DB_POOL_SIZE.labels(service=svc).set(pool.size())
+                DB_POOL_CHECKED_OUT.labels(service=svc).set(pool.checkedout())
         except Exception:
             pass
 

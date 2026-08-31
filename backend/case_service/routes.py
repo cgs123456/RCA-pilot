@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 import anyio.to_thread
 import httpx
 from fastapi import APIRouter, Depends, Query, Request
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -946,7 +946,7 @@ async def get_trend(
             Deviation.case_type,
             func.count().label("cnt"),
         )
-        .where(Deviation.discovered_at >= func.now() - func.cast(f"{days} days", func.text("interval")))
+        .where(Deviation.discovered_at >= func.now() - text(f"interval '{days} days'"))
         .group_by("date", Deviation.case_type)
         .order_by("date")
     )).all()

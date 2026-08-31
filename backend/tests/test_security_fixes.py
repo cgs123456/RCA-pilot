@@ -32,7 +32,7 @@ def _auth_ctx(user, permissions):
         session_id="test-session",
         ip_address="127.0.0.1",
         permissions=permissions,
-        db=None,
+        db=None,  # type: ignore[arg-type]  # 该测试无真实 session，AuthContext 运行时允许 None
     )
 
 

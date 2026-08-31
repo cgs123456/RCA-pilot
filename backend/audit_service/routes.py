@@ -198,7 +198,7 @@ async def export_logs(
                 buf.seek(0)
                 buf.truncate(0)
                 writer.writerow([
-                    _csv_safe(r.seq), _csv_safe(r.log_id), _csv_safe(r.created_at.isoformat()),
+                    _csv_safe(str(r.seq)), _csv_safe(r.log_id), _csv_safe(r.created_at.isoformat()),
                     _csv_safe(r.operator), _csv_safe(r.action), _csv_safe(r.target),
                     _csv_safe(r.detail), _csv_safe(r.ip_address), _csv_safe(r.session_id),
                     _csv_safe("|".join(r.evidence_refs or [])),

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
 from fastapi import APIRouter, Depends, Query
 
@@ -13,7 +14,7 @@ router = APIRouter(prefix="/ems", tags=["ems-connector"], dependencies=[Depends(
 # ============================================================
 #  Mock 数据 — 模拟 EMS 数据库（沉降菌/浮游菌采样）
 # ============================================================
-MONITORING_POINTS = {
+MONITORING_POINTS: dict[str, Any] = {
     "Room-3B-Act-12": {
         "point_id": "Room-3B-Act-12",
         "area": "B 级区 Room-3B",
