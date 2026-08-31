@@ -61,7 +61,9 @@ exclude = [
     "alembic/versions",  # 自动生成
 ]
 
+# ============================================================
 # 第三方库忽略
+# ============================================================
 [[tool.mypy.overrides]]
 module = ["passlib.*", "slowapi.*", "prometheus_client.*"]
 ignore_missing_imports = true
