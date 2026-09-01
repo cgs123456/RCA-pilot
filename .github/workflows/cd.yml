@@ -118,7 +118,7 @@ jobs:
 
       - name: SSH 部署到 staging 服务器
         id: deploy
-        uses: appleboy/ssh-action@v1.0.3
+        uses: appleboy/ssh-action@v1.2.5
         with:
           host: ${{ secrets.STAGING_SSH_HOST }}
           username: ${{ secrets.STAGING_SSH_USER }}
