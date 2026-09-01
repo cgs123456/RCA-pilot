@@ -68,7 +68,7 @@ jobs:
           } >> $GITHUB_OUTPUT
 
       - name: 构建并推送后端镜像（一次构建，多服务名 tag）
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: deploy/Dockerfile.backend
@@ -78,7 +78,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: 构建并推送前端镜像
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: deploy/Dockerfile.frontend
