@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 
@@ -19,6 +20,24 @@ from fastapi.middleware.cors import CORSMiddleware
 from .config import settings
 from .error_handler import TraceIdMiddleware, register_exception_handlers
 from .logging import setup_logging
+
+
+def spawn_logged_task(coro, logger, name: str) -> asyncio.Task:
+    """创建带退出日志的后台任务——意外死亡必须留痕，不能只有 asyncio 的默认告警。
+
+    调用方 shutdown 时 task.cancel() 后应 `with suppress(CancelledError): await task`。
+    """
+    task = asyncio.create_task(coro, name=name)
+
+    def _done(t: asyncio.Task) -> None:
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            logger.error("后台任务 %s 意外退出: %r", name, exc)
+
+    task.add_done_callback(_done)
+    return task
 
 
 def create_app(
@@ -34,13 +53,14 @@ def create_app(
     Args:
         service_name: 服务名（如 "auth_service"）
         version: 服务版本
-        lifespan: 自定义生命周期（覆盖默认 logging 初始化）
+        lifespan: 额外的生命周期任务（如后台锚定循环）；与默认的可观测性初始化
+            叠加执行而非覆盖——logging/Sentry 初始化无条件先行，自定义任务随后
         enable_metrics: 是否启用 Prometheus metrics
         enable_rate_limit: 是否启用 slowapi 限流
     """
 
     @asynccontextmanager
-    async def default_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    async def composed_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         setup_logging(service_name)
         # Sentry 初始化（如果配置了 DSN）
         if settings.sentry_dsn:
@@ -58,7 +78,11 @@ def create_app(
                     SqlalchemyIntegration(),
                 ],
             )
-        yield
+        if lifespan is not None:
+            async with lifespan(app):
+                yield
+        else:
+            yield
 
     # prod 关闭 API 文档（减少攻击面），并收紧 CORS 方法/头
     is_prod = settings.env == "prod"
@@ -69,7 +93,7 @@ def create_app(
         docs_url=None if is_prod else "/docs",
         redoc_url=None if is_prod else "/redoc",
         openapi_url=None if is_prod else f"/{service_name}/openapi.json",
-        lifespan=lifespan or default_lifespan,
+        lifespan=composed_lifespan,
     )
 
     # ============================================================

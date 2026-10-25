@@ -5,6 +5,8 @@ import api from './api-client';
 import type {
   Deviation,
   DeviationDetail,
+  DeviationType,
+  FmeaScores,
   KPI,
   Page,
   HitlGateResponse,
@@ -27,6 +29,8 @@ export interface CreateCaseBody {
   title: string;
   description?: string;
   severity?: 'critical' | 'major' | 'minor' | 'info';
+  deviation_type?: DeviationType;
+  affected_batches?: string[];
   case_type?: string;
   complexity?: number;
   location?: string;
@@ -34,12 +38,16 @@ export interface CreateCaseBody {
   shift?: string;
   investigator_id?: string;
   qa_reviewer_id?: string;
+  risk_owner?: string;
   discovered_at: string;
   deadline?: string;
   organism?: string;
   organism_source?: string;
   product_impact?: string;
   immediate_action?: string;
+  /** ICH Q9 FMEA 初评（RPN=S×O×D） */
+  fmea?: FmeaScores;
+  meta?: Record<string, unknown>;
 }
 
 /** 更新偏差请求体（与后端 DeviationUpdate 对齐；progress 由系统管控不可提交） */
@@ -47,6 +55,8 @@ export interface UpdateCaseBody {
   title?: string;
   description?: string;
   severity?: 'critical' | 'major' | 'minor';
+  deviation_type?: DeviationType;
+  affected_batches?: string[];
   status?: 'investigating';
   investigator_id?: string;
   qa_reviewer_id?: string;

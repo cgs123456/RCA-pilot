@@ -38,6 +38,9 @@ export function DashboardPage() {
     queryFn: caseApi.getSourceSystems,
   });
 
+  // 真实健康态：任一数据源加载失败即降级显示（替代硬编码「系统正常」）
+  const degraded = casesError || auditError || sourcesError;
+
   return (
     <div className="p-6 space-y-6">
       {/* 标题区 */}
@@ -46,8 +49,8 @@ export function DashboardPage() {
           <h1 className="text-2xl font-bold text-ink-900">仪表盘</h1>
           <p className="text-sm text-ink-500 mt-1">偏差调查全局视图与关键指标</p>
         </div>
-        <Badge variant="success">
-          <ShieldCheck className="w-3 h-3" /> 系统正常
+        <Badge variant={degraded ? 'warning' : 'success'}>
+          <ShieldCheck className="w-3 h-3" /> {degraded ? '部分数据源异常' : '系统正常'}
         </Badge>
       </div>
 
@@ -102,7 +105,14 @@ export function DashboardPage() {
             <div className="divide-y divide-ink-200">
               {casesError ? (
                 <ErrorBanner message="案例列表加载失败" onRetry={() => refetchCases()} />
-              ) : casesData?.items?.map((c) => (
+              ) : casesLoading ? (
+                <div className="px-5 py-8 text-center text-sm text-ink-500">加载中...</div>
+              ) : !casesData?.items?.length ? (
+                <div className="px-5 py-8 text-center text-sm text-ink-500">
+                  暂无案例 — 点击右上角「查看全部」创建第一条偏差
+                </div>
+              ) : (
+                casesData.items.map((c) => (
                 <Link
                   key={c.id}
                   to={`/investigation/${c.id}`}
@@ -138,11 +148,8 @@ export function DashboardPage() {
                       <span className="text-[10px] text-ink-500 mt-1">{c.progress}%</span>
                     </div>
                   </div>
-                </Link>
-              )) || (
-                <div className="px-5 py-8 text-center text-sm text-ink-500">
-                  {casesLoading ? '加载中...' : '暂无案例'}
-                </div>
+                 </Link>
+              ))
               )}
             </div>
           </CardBody>
@@ -158,7 +165,12 @@ export function DashboardPage() {
             <div className="divide-y divide-ink-200">
               {sourcesError ? (
                 <ErrorBanner message="源系统状态加载失败" />
-              ) : sources?.map((s) => (
+              ) : !sources?.length ? (
+                <div className="px-5 py-8 text-center text-sm text-ink-500">
+                  {sources === undefined ? '加载中...' : '暂无源系统'}
+                </div>
+              ) : (
+                sources.map((s) => (
                 <div key={s.code} className="px-5 py-3 flex items-center justify-between">
                   <div className="flex items-center gap-2">
                     <span className={`text-xs px-1.5 py-0.5 rounded ${sourceBadgeClass(s.code)}`}>
@@ -176,10 +188,7 @@ export function DashboardPage() {
                     <span className="text-xs text-ink-500">{s.health_status}</span>
                   </div>
                 </div>
-              )) || (
-                <div className="px-5 py-8 text-center text-sm text-ink-500">
-                  {sources === undefined ? '加载中...' : '暂无源系统'}
-                </div>
+              ))
               )}
             </div>
           </CardBody>
@@ -198,7 +207,12 @@ export function DashboardPage() {
           <div className="divide-y divide-ink-200">
             {auditError ? (
               <ErrorBanner message="审计日志加载失败" />
-            ) : auditData?.items?.map((log) => (
+            ) : !auditData?.items?.length ? (
+              <div className="px-5 py-8 text-center text-sm text-ink-500">
+                {auditData === undefined ? '加载中...' : '暂无审计日志'}
+              </div>
+            ) : (
+              auditData.items.map((log) => (
               <div key={log.log_id} className="px-5 py-3 flex items-center gap-3">
                 <span className="text-xs font-mono text-ink-400 w-12">#{log.seq}</span>
                 <Badge variant="default">{log.action}</Badge>
@@ -215,8 +229,7 @@ export function DashboardPage() {
                   {log.current_hash.slice(0, 10)}...
                 </span>
               </div>
-            )) || (
-              <div className="px-5 py-8 text-center text-sm text-ink-500">加载中...</div>
+            ))
             )}
           </div>
         </CardBody>

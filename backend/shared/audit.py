@@ -8,13 +8,17 @@
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from datetime import UTC, datetime
 
 from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .exceptions import AuditIntegrityError
+from .metrics import AUDIT_SEQ_CONFLICT_RETRIES_TOTAL
 from .models import AuditLog
 from .schemas import AuditLogCreate
 
@@ -23,6 +27,9 @@ GENESIS_HASH = "0" * 64
 
 # 审计链写入串行锁（pg_advisory_xact_lock 的锁键）
 _AUDIT_LOCK_KEY = "rca_audit_log_seq"
+
+# seq 冲突重试（仅在锁兜底失效时发生，例如锁获取异常后的竞态窗口）
+_AUDIT_SEQ_MAX_ATTEMPTS = 5
 
 # hash 覆盖的字段版本号 —— 字段集变化时递增（旧链需重建）
 _HASH_SCHEMA_VERSION = 2
@@ -171,56 +178,70 @@ async def append_audit_log(
     # 并发安全：先取 advisory lock 再读链尾，避免两个请求读到同一 prev_hash/seq
     await _acquire_audit_lock(db)
 
-    prev_hash, last_seq = await get_last_hash(db)
-    seq = last_seq + 1
-    now = datetime.now(UTC)
-    # 使用不含 tz 后缀的 ISO 格式，避免不同 DB 驱动对 tzinfo 处理不一致
-    # （SQLite 读出 datetime 会丢失 tzinfo，PostgreSQL 保留；统一用无 tz 格式保证 hash 稳定）
-    timestamp_iso = now.replace(tzinfo=None).isoformat()
+    # B10：插入包 SAVEPOINT —— seq UNIQUE 冲突只回滚审计行（SAVEPOINT），业务事务存活；
+    # 冲突后重读链尾重算 seq 重试（竞态窗口：另一写入者在锁兜底失效时先落了同 seq）。
+    for attempt in range(_AUDIT_SEQ_MAX_ATTEMPTS):
+        prev_hash, last_seq = await get_last_hash(db)
+        seq = last_seq + 1
+        now = datetime.now(UTC)
+        # 使用不含 tz 后缀的 ISO 格式，避免不同 DB 驱动对 tzinfo 处理不一致
+        # （SQLite 读出 datetime 会丢失 tzinfo，PostgreSQL 保留；统一用无 tz 格式保证 hash 稳定）
+        timestamp_iso = now.replace(tzinfo=None).isoformat()
 
-    current_hash = _hash_payload(
-        prev_hash=prev_hash,
-        seq=seq,
-        operator=entry.operator,
-        action=entry.action,
-        target=entry.target,
-        detail=entry.detail,
-        timestamp_iso=timestamp_iso,
-        evidence_refs=entry.evidence_refs,
-        ip_address=entry.ip_address,
-        session_id=entry.session_id,
-        ai_model=entry.ai_model,
-        ai_prompt_hash=entry.ai_prompt_hash,
-        ai_output_hash=entry.ai_output_hash,
-        trace_id=trace_id,
-    )
+        current_hash = _hash_payload(
+            prev_hash=prev_hash,
+            seq=seq,
+            operator=entry.operator,
+            action=entry.action,
+            target=entry.target,
+            detail=entry.detail,
+            timestamp_iso=timestamp_iso,
+            evidence_refs=entry.evidence_refs,
+            ip_address=entry.ip_address,
+            session_id=entry.session_id,
+            ai_model=entry.ai_model,
+            ai_prompt_hash=entry.ai_prompt_hash,
+            ai_output_hash=entry.ai_output_hash,
+            trace_id=trace_id,
+        )
 
-    log_id = (
-        f"LOG-{now.strftime('%Y%m%dT%H%M%S')}"
-        f"-{seq:04d}"
-    )
+        log_id = (
+            f"LOG-{now.strftime('%Y%m%dT%H%M%S')}"
+            f"-{seq:04d}"
+        )
 
-    log = AuditLog(
-        log_id=log_id,
-        seq=seq,
-        operator=entry.operator,
-        action=entry.action,
-        target=entry.target,
-        detail=entry.detail,
-        ip_address=entry.ip_address,
-        session_id=entry.session_id,
-        evidence_refs=entry.evidence_refs,
-        ai_model=entry.ai_model,
-        ai_prompt_hash=entry.ai_prompt_hash,
-        ai_output_hash=entry.ai_output_hash,
-        trace_id=trace_id,
-        prev_hash=prev_hash,
-        current_hash=current_hash,
-        created_at=now,
-    )
-    db.add(log)
-    await db.flush()
-    return log
+        log = AuditLog(
+            log_id=log_id,
+            seq=seq,
+            operator=entry.operator,
+            action=entry.action,
+            target=entry.target,
+            detail=entry.detail,
+            ip_address=entry.ip_address,
+            session_id=entry.session_id,
+            evidence_refs=entry.evidence_refs,
+            ai_model=entry.ai_model,
+            ai_prompt_hash=entry.ai_prompt_hash,
+            ai_output_hash=entry.ai_output_hash,
+            trace_id=trace_id,
+            prev_hash=prev_hash,
+            current_hash=current_hash,
+            created_at=now,
+        )
+        try:
+            async with db.begin_nested():
+                db.add(log)
+                await db.flush()
+            return log
+        except IntegrityError:
+            AUDIT_SEQ_CONFLICT_RETRIES_TOTAL.inc()
+            if attempt == _AUDIT_SEQ_MAX_ATTEMPTS - 1:
+                raise AuditIntegrityError(
+                    "审计 seq 分配持续冲突，为保链完整性拒绝写入（业务事务将回滚）",
+                    error_code="E3002",
+                ) from None
+            await asyncio.sleep(0.05 * (attempt + 1))
+    raise AuditIntegrityError("审计写入重试耗尽", error_code="E3002")  # pragma: no cover
 
 
 async def verify_hash_chain(db: AsyncSession, start_seq: int = 1) -> bool:

@@ -1,5 +1,10 @@
 # RCA Pilot Backend — Python 依赖
 # Phase 2 大厂标准版
+#
+# 运行时依赖（开发/测试工具见 requirements-dev.txt）。
+# 生产镜像与 CI 迁移校验使用 requirements.lock（pip-compile --generate-hashes
+# 生成，传递依赖全量哈希锁定）；升级依赖后须重新生成：
+#   pip-compile --generate-hashes --no-strip-extras -o requirements.lock requirements.txt
 
 # ============================================================
 # Web 框架
@@ -13,6 +18,7 @@ httpx==0.28.1
 # ============================================================
 sqlalchemy[asyncio]==2.0.35
 asyncpg==0.29.0
+pgvector==0.5.1  # SQLAlchemy Vector 类型（evidence.embedding_vec 检索列双写）
 aiosqlite==0.20.0           # SQLAlchemy async SQLite 驱动（CI 测试用）
 psycopg2-binary==2.9.9  # Alembic + seed 同步模式
 alembic==1.13.3         # 版本化迁移
@@ -43,13 +49,3 @@ sentry-sdk[fastapi]==2.18.0  # 异常捕捉
 # Feature Flag（Phase 2c 灰度发布）
 # ============================================================
 unleashclient==6.1.0        # Unleash SDK，可对接自建 Unleash 服务
-
-# ============================================================
-# 测试与质量（dev 依赖，CI 中必需）
-# ============================================================
-pytest==9.0.3
-pytest-asyncio==1.4.0
-pytest-cov==7.0.0
-pytest-httpx==0.36.2        # FastAPI TestClient HTTP 拦截
-ruff==0.7.4                 # Lint + Format
-mypy==1.13.0                # 类型检查

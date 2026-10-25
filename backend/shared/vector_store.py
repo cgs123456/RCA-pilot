@@ -1,13 +1,20 @@
-"""向量检索 — 纯 Python 余弦相似度（不依赖 numpy/Chroma/faiss/sqlite-vec）
+"""向量检索 — PostgreSQL pgvector 库内余弦（H20/C13），非 PG 降级纯 Python 余弦
 
 设计目标：
-1. **零额外依赖**：纯 Python 实现余弦相似度，带候选数上限
-2. **DB 持久化**：embedding 存在 Evidence 表 JSONB 列
-3. **降级友好**：LLM 未配置时降级到关键词 Jaccard 搜索
-4. **跨案例关联**：支持搜索非当前案例的证据，用于 related_historical_cases
+1. **PG 主路径**：embedding 双写 JSONB + pgvector `embedding_vec` 列，搜索用
+   `<=>`（余弦距离）在库内完成 —— C 实现，无候选数上限（旧实现限 2000 条，
+   老证据静默丢失），也不再阻塞事件循环
+2. **零额外依赖（降级路径）**：SQLite（测试）/未启用 pgvector 的库上回退
+   纯 Python 余弦，保留 2000 条候选上限并显式告警（不再静默丢弃）
+3. **模型过滤**：不同 embedding model 的向量维度/语义空间不同，余弦值无意义，
+   两种路径都按 `embedding_model` 过滤（由调用方传入当前模型名）
+4. **降级友好**：LLM 未配置时降级到关键词 Jaccard 搜索
+5. **跨案例关联**：支持搜索非当前案例的证据，用于 related_historical_cases
 
-规模提示：候选上限 2000 条适用于中小规模；证据量增长到万级以上时应迁移
-pgvector（HNSW 索引）做 ANN 检索。
+注：HNSW 索引要求数十维以下的固定维度列；当前多 provider（GLM/Qwen/OpenAI）
+维度不一，库内精确扫描已满足十万级以内规模。固定维度后可再加
+`CREATE INDEX ... USING hnsw (embedding_vec vector_cosine_ops)`（见
+alembic 20261025_0006 docstring）。
 
 用法：
     from shared.vector_store import vector_search, keyword_search, search_evidence
@@ -22,14 +29,17 @@ pgvector（HNSW 索引）做 ANN 检索。
 """
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from typing import cast
 
-from sqlalchemy import select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import Evidence
+
+logger = logging.getLogger("vector-store")
 
 
 # ============================================================
@@ -65,12 +75,21 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
+def _is_postgresql(db: AsyncSession) -> bool:
+    """当前会话是否连接 PostgreSQL（决定 pgvector 路径可用性）"""
+    try:
+        return db.get_bind().dialect.name == "postgresql"
+    except Exception:  # pragma: no cover - 无绑定的会话视为不可用
+        return False
+
+
 async def vector_search(
     db: AsyncSession,
     query_embedding: list[float],
     top_k: int = 10,
     exclude_case_id: str | None = None,
     max_candidates: int = 2000,
+    embedding_model: str | None = None,
 ) -> list[SearchResult]:
     """向量语义搜索
 
@@ -79,21 +98,91 @@ async def vector_search(
         query_embedding: 查询向量
         top_k: 返回前 K 条
         exclude_case_id: 排除该案例的证据（用于跨案例关联时排除自身）
-        max_candidates: 参与相似度计算的最大候选数（防止全表加载；
-            证据量超过此值时应迁移 pgvector + HNSW 索引）
+        max_candidates: 仅降级路径生效 —— 参与相似度计算的最大候选数
+        embedding_model: 按 embedding_model 过滤（不同模型的向量不可比）
 
     Returns:
         List[SearchResult]: 按相似度降序排列的结果
     """
-    # 候选上限 + 确定性排序（新证据优先参与计算），避免每次搜索全表 IO + O(N·D) CPU
-    stmt = (
-        select(Evidence)
-        .where(Evidence.embedding.isnot(None))
-        .order_by(Evidence.created_at.desc())
-        .limit(max_candidates)
+    # PG + pgvector 主路径：库内 <=> 余弦，无候选数上限，不阻塞事件循环
+    if _is_postgresql(db):
+        return await _vector_search_pg(
+            db, query_embedding, top_k, exclude_case_id, embedding_model
+        )
+    return await _vector_search_python(
+        db, query_embedding, top_k, exclude_case_id, max_candidates, embedding_model
     )
+
+
+async def _vector_search_pg(
+    db: AsyncSession,
+    query_embedding: list[float],
+    top_k: int,
+    exclude_case_id: str | None,
+    embedding_model: str | None,
+) -> list[SearchResult]:
+    """pgvector 路径：embedding_vec 列（alembic 20261025_0006 建 + 回填）"""
+    sql = """
+        SELECT id, case_id, source_system, summary,
+               1 - (embedding_vec <=> CAST(:qv AS vector)) AS score
+        FROM evidence
+        WHERE embedding_vec IS NOT NULL
+          AND vector_dims(embedding_vec) = :dim
+    """
+    params: dict = {"qv": _to_vector_text(query_embedding), "dim": len(query_embedding)}
+    if exclude_case_id:
+        sql += " AND case_id != :exclude"
+        params["exclude"] = exclude_case_id
+    if embedding_model:
+        sql += " AND embedding_model = :model"
+        params["model"] = embedding_model
+    sql += " ORDER BY embedding_vec <=> CAST(:qv2 AS vector) LIMIT :k"
+    params["qv2"] = params["qv"]
+    params["k"] = top_k
+
+    rows = (await db.execute(text(sql), params)).mappings().all()
+    return [
+        SearchResult(
+            evidence_id=row["id"],
+            case_id=row["case_id"],
+            source_system=row["source_system"],
+            summary=row["summary"] or "",
+            score=float(row["score"]),
+            matched_by="semantic",
+        )
+        for row in rows
+    ]
+
+
+def _to_vector_text(vec: list[float]) -> str:
+    """python list[float] → pgvector 文本字面量 '[1.0,2.0,...]'"""
+    return "[" + ",".join(repr(float(x)) for x in vec) + "]"
+
+
+async def _vector_search_python(
+    db: AsyncSession,
+    query_embedding: list[float],
+    top_k: int,
+    exclude_case_id: str | None,
+    max_candidates: int,
+    embedding_model: str | None,
+) -> list[SearchResult]:
+    """降级路径（SQLite 测试 / 未装 pgvector 的库）：纯 Python 余弦"""
+    # 候选上限 + 确定性排序（新证据优先参与计算），避免每次搜索全表 IO + O(N·D) CPU
+    stmt = select(Evidence).where(Evidence.embedding.isnot(None))
+    if embedding_model:
+        stmt = stmt.where(Evidence.embedding_model == embedding_model)
     if exclude_case_id:
         stmt = stmt.where(Evidence.case_id != exclude_case_id)
+    # 候选总量计数（H20：超过上限的旧证据不再静默丢失，显式告警）
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    if total > max_candidates:
+        logger.warning(
+            "向量候选 %d 条超过降级路径上限 %d，仅最新 %d 条参与检索"
+            "（生产环境应确保 pgvector 主路径生效，否则旧证据检索不到）",
+            total, max_candidates, max_candidates,
+        )
+    stmt = stmt.order_by(Evidence.created_at.desc()).limit(max_candidates)
     result = await db.execute(stmt)
     evidences = result.scalars().all()
 
@@ -200,6 +289,7 @@ async def search_evidence(
     top_k: int = 10,
     exclude_case_id: str | None = None,
     query_embedding: list[float] | None = None,
+    embedding_model: str | None = None,
 ) -> list[SearchResult]:
     """证据搜索 — 优先语义搜索，降级到关键词搜索
 
@@ -209,12 +299,16 @@ async def search_evidence(
         top_k: 返回前 K 条
         exclude_case_id: 排除该案例
         query_embedding: 查询向量（None 时走关键词搜索）
+        embedding_model: 语义路径按 embedding_model 过滤
 
     Returns:
         List[SearchResult]
     """
     if query_embedding:
-        results = await vector_search(db, query_embedding, top_k, exclude_case_id)
+        results = await vector_search(
+            db, query_embedding, top_k, exclude_case_id,
+            embedding_model=embedding_model,
+        )
         if results:
             return results
         # 向量为空或无结果时降级
@@ -230,6 +324,7 @@ async def find_related_cases(
     top_k: int = 5,
     exclude_case_id: str | None = None,
     query_embedding: list[float] | None = None,
+    embedding_model: str | None = None,
 ) -> list[dict]:
     """跨案例关联 — 找出与当前案例相关的历史案例
 
@@ -239,6 +334,7 @@ async def find_related_cases(
         top_k: 返回前 K 个相关案例
         exclude_case_id: 排除当前案例
         query_embedding: 查询向量
+        embedding_model: 语义路径按 embedding_model 过滤
 
     Returns:
         List[dict]: [{"case_id": "DEV-XXX", "evidence_ids": [...], "score": 0.85}, ...]
@@ -247,6 +343,7 @@ async def find_related_cases(
         db, query, top_k=top_k * 3,  # 取更多证据后再按案例聚合
         exclude_case_id=exclude_case_id,
         query_embedding=query_embedding,
+        embedding_model=embedding_model,
     )
 
     # 按案例聚合

@@ -271,51 +271,63 @@ async def seed_database():
 
         # 2. 清空旧数据（保留表结构）
         # GxP: audit_log 与 signatures 受防篡改触发器保护（含 TRUNCATE），默认保留。
-        # 仅当显式设置 SEED_RESET_AUDIT=1 时，用 session_replication_role=replica
-        # 这一受控运维操作绕过触发器清空 —— 该操作会被明确记录。
+        # 仅当显式设置 SEED_RESET_AUDIT=1 时清空 —— 该操作会被明确记录。
+        # 注意两点 PostgreSQL 语义：
+        # ① TRUNCATE ... CASCADE 会把通过 FK 引用 users/deviations 的 signatures
+        #    一并纳入 truncate 集合，而 statement 级 BEFORE TRUNCATE 触发器对集合中
+        #    每张表都会触发 —— 必须先卸除守卫触发器，结束后重建；
+        # ② signatures 非空时会被 CASCADE 连带清空，与"保留签名连续性"承诺冲突，
+        #    因此非 reset 模式下发现签名记录必须显式拒绝（fail-closed）。
         import os
         reset_audit = os.getenv("SEED_RESET_AUDIT", "") == "1"
+        existing_signatures = await conn.fetchval("SELECT count(*) FROM signatures")
+        if existing_signatures and not reset_audit:
+            raise SystemExit(
+                "[seed] signatures 表非空且未设置 SEED_RESET_AUDIT=1 —— "
+                "TRUNCATE CASCADE 会连带清空签名记录（21 CFR Part 11 数据）；"
+                "如确需完全重置请显式设置 SEED_RESET_AUDIT=1"
+            )
         print("[seed] 清空旧数据...")
+        await conn.execute("DROP TRIGGER IF EXISTS trg_audit_log_no_truncate ON audit_log")
+        await conn.execute("DROP TRIGGER IF EXISTS trg_signatures_no_truncate ON signatures")
         for table in ["agent_runs", "skeptic_challenges", "five_whys", "timeline_events", "evidence", "deviations", "source_systems", "users"]:
-            await conn.execute(f'TRUNCATE TABLE {table} RESTART IDENTITY CASCADE')
+            await conn.execute(f'TRUNCATE TABLE {table} RESTART IDENTITY CASCADE')  # nosec B608 — 表名硬编码白名单
         if reset_audit:
             print("[seed] SEED_RESET_AUDIT=1 — 受控清空 audit_log/signatures（GxP 敏感操作）")
-            # session_replication_role=replica 对 BEFORE TRUNCATE 触发器无效，改用显式卸除/重建
-            await conn.execute("DROP TRIGGER IF EXISTS trg_audit_log_no_truncate ON audit_log")
-            await conn.execute("DROP TRIGGER IF EXISTS trg_signatures_no_truncate ON signatures")
             await conn.execute('TRUNCATE TABLE audit_log RESTART IDENTITY CASCADE')
             await conn.execute('TRUNCATE TABLE signatures RESTART IDENTITY CASCADE')
-            # 重新创建防篡改触发器，确保 GxP 合规性得以延续
-            await conn.execute("""
-                CREATE OR REPLACE FUNCTION audit_log_no_truncate_guard() RETURNS trigger AS $$
-                BEGIN
-                    RAISE EXCEPTION 'audit_log 表受 GxP 合规保护，禁止 TRUNCATE 操作';
-                END;
-                $$ LANGUAGE plpgsql;
-            """)
-            await conn.execute("""
-                CREATE OR REPLACE FUNCTION signatures_immutable_guard() RETURNS trigger AS $$
-                BEGIN
-                    RAISE EXCEPTION 'signatures 表受 21 CFR Part 11 保护，禁止 TRUNCATE 操作';
-                END;
-                $$ LANGUAGE plpgsql;
-            """)
-            await conn.execute("""
-                CREATE TRIGGER trg_audit_log_no_truncate BEFORE TRUNCATE ON audit_log FOR STATEMENT EXECUTE FUNCTION audit_log_no_truncate_guard()
-            """)
-            await conn.execute("""
-                CREATE TRIGGER trg_signatures_no_truncate BEFORE TRUNCATE ON signatures FOR STATEMENT EXECUTE FUNCTION signatures_immutable_guard()
-            """)
         else:
             print("[seed] 保留 audit_log/signatures（审计与签名连续性）；如需重建请设置 SEED_RESET_AUDIT=1")
+        # 重建防篡改触发器，确保 GxP 合规性得以延续（两分支共用）
+        await conn.execute("""
+            CREATE OR REPLACE FUNCTION audit_log_no_truncate_guard() RETURNS trigger AS $$
+            BEGIN
+                RAISE EXCEPTION 'audit_log 表受 GxP 合规保护，禁止 TRUNCATE 操作';
+            END;
+            $$ LANGUAGE plpgsql;
+        """)
+        await conn.execute("""
+            CREATE OR REPLACE FUNCTION signatures_immutable_guard() RETURNS trigger AS $$
+            BEGIN
+                RAISE EXCEPTION 'signatures 表受 21 CFR Part 11 保护，禁止 TRUNCATE 操作';
+            END;
+            $$ LANGUAGE plpgsql;
+        """)
+        await conn.execute("""
+            CREATE TRIGGER trg_audit_log_no_truncate BEFORE TRUNCATE ON audit_log FOR STATEMENT EXECUTE FUNCTION audit_log_no_truncate_guard()
+        """)
+        await conn.execute("""
+            CREATE TRIGGER trg_signatures_no_truncate BEFORE TRUNCATE ON signatures FOR STATEMENT EXECUTE FUNCTION signatures_immutable_guard()
+        """)
 
         # 3. 加载用户（含密码 hash）
         from shared.security import hash_password
         print(f"[seed] 加载 {len(USERS)} 个用户...")
         for u in USERS:
             await conn.execute(
-                """INSERT INTO users (id, email, name, role, dept, title, avatar, color, shift, cert, password_hash, is_active)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,TRUE)""",
+                """INSERT INTO users (id, email, name, role, dept, title, avatar, color, shift, cert, password_hash, is_active,
+                                        failed_login_attempts, created_at, updated_at)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,TRUE,0,NOW(),NOW())""",
                 u["id"], u["email"], u["name"], u["role"], u["dept"], u["title"],
                 u["avatar"], u["color"], u["shift"], u["cert"],
                 hash_password(u["password"]),
@@ -331,17 +343,23 @@ async def seed_database():
             )
 
         # 5. 加载案例 + 证据 + 时间线 + 5Whys + Skeptic
+        from datetime import datetime
+
+        def _ts(v: object) -> object:
+            # 种子数据沿用 Demo mock 的 ISO 字符串；asyncpg 需要原生 datetime
+            return datetime.fromisoformat(v) if isinstance(v, str) else v
+
         for case in ALL_CASES:
             print(f"[seed] 加载案例 {case['id']} ({case['title'][:30]}...)")
             await conn.execute(
                 """INSERT INTO deviations
                    (id, title, description, severity, status, case_type, complexity, location, area, shift,
                     investigator_id, qa_reviewer_id, discovered_at, deadline, organism, organism_source,
-                    product_impact, immediate_action, progress, hitl_gates, meta)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)""",
+                    product_impact, immediate_action, progress, hitl_gates, meta, created_at, updated_at)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,NOW(),NOW())""",
                 case["id"], case["title"], case["description"], case["severity"], case["status"],
                 case["case_type"], case["complexity"], case["location"], case["area"], case["shift"],
-                case["investigator_id"], case["qa_reviewer_id"], case["discovered_at"], case["deadline"],
+                case["investigator_id"], case["qa_reviewer_id"], _ts(case["discovered_at"]), _ts(case["deadline"]),
                 case.get("organism"), case.get("organism_source"), case.get("product_impact"),
                 case.get("immediate_action"), case["progress"], json.dumps(case["hitl_gates"]),
                 json.dumps(case["meta"]),
@@ -351,9 +369,9 @@ async def seed_database():
             for ev in case["evidence"]:
                 h = evidence_hash(ev["raw"])
                 await conn.execute(
-                    """INSERT INTO evidence (id, case_id, source_system, collected_at, summary, raw_data, content_hash, confidence)
-                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)""",
-                    ev["id"], case["id"], ev["source_system"], ev["collected_at"],
+                    """INSERT INTO evidence (id, case_id, source_system, collected_at, summary, raw_data, content_hash, confidence, is_signed, created_at)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,FALSE,NOW())""",
+                    ev["id"], case["id"], ev["source_system"], _ts(ev["collected_at"]),
                     ev["summary"], json.dumps(ev["raw"]), h, ev["confidence"],
                 )
 
@@ -362,53 +380,63 @@ async def seed_database():
                 await conn.execute(
                     """INSERT INTO timeline_events (id, case_id, occurred_at, source, title, detail, severity, evidence_id, is_anomaly, sort_order)
                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)""",
-                    t["id"], case["id"], t["occurred_at"], t["source"], t["title"], t["detail"],
+                    t["id"], case["id"], _ts(t["occurred_at"]), t["source"], t["title"], t["detail"],
                     t["severity"], t.get("evidence_id"), t.get("is_anomaly", False), t["sort_order"],
                 )
 
             # 5 Whys
             for w in case["five_whys"]:
                 await conn.execute(
-                    """INSERT INTO five_whys (id, case_id, n, question, answer, status, evidence_ids, is_root_cause, ai_model, ai_output_hash)
-                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)""",
+                    """INSERT INTO five_whys (id, case_id, n, question, answer, status, evidence_ids, is_root_cause, ai_model, ai_output_hash, created_at, updated_at)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW(),NOW())""",
                     w["id"], case["id"], w["n"], w["question"], w["answer"], w["status"],
-                    w["evidence_ids"], w["is_root_cause"], w.get("ai_model"), w.get("ai_output_hash"),
+                    json.loads(w["evidence_ids"]) if isinstance(w["evidence_ids"], str) else w["evidence_ids"],
+                    w["is_root_cause"], w.get("ai_model"), w.get("ai_output_hash"),
                 )
 
             # Skeptic 挑战
             for sk in case["skeptic_challenges"]:
                 await conn.execute(
-                    """INSERT INTO skeptic_challenges (id, case_id, target, challenge, evidence_ids, status)
-                       VALUES ($1,$2,$3,$4,$5,$6)""",
-                    sk["id"], case["id"], sk["target"], sk["challenge"], sk["evidence_ids"], sk["status"],
+                    """INSERT INTO skeptic_challenges (id, case_id, target, challenge, evidence_ids, status, created_at)
+                       VALUES ($1,$2,$3,$4,$5,$6,NOW())""",
+                    sk["id"], case["id"], sk["target"], sk["challenge"],
+                    json.loads(sk["evidence_ids"]) if isinstance(sk["evidence_ids"], str) else sk["evidence_ids"],
+                    sk["status"],
                 )
 
         # 6. 初始审计日志（hash 链起点）
+        # 必须复用 shared/audit.py 的 v2 hash 格式与 GENESIS_HASH，且
+        # created_at 与参与 hash 的时间戳同源（_normalize_ts 口径：无时区 isoformat），
+        # 否则种子库上 verify_hash_chain 永远 False（GxP 链假性断裂）。
+        from shared.audit import GENESIS_HASH, _hash_payload
+
         print("[seed] 写入初始审计日志...")
-        initial_logs = [
+        initial_logs: list[dict[str, Any]] = [
             {"operator": "system", "action": "SYSTEM_INIT", "target": "schema", "detail": "数据库初始化 + 种子数据加载", "evidence_refs": []},
             {"operator": "system", "action": "CREATE_DEVIATION", "target": "DEV-2025-08-147", "detail": "EMS 自动告警触发偏差创建", "evidence_refs": ["E-EMS-05"]},
         ]
-        prev_hash = "0" * 40
+        prev_hash = GENESIS_HASH
         for i, log in enumerate(initial_logs, 1):
-            now_iso = datetime.now(UTC).isoformat()
-            parts = [prev_hash, str(i), log["operator"], log["action"], log["target"], log["detail"], now_iso, json.dumps(log["evidence_refs"])]
-            current_hash = "sha256:" + hashlib.sha256("|".join(str(x) for x in parts).encode()).hexdigest()
+            created = datetime.now(UTC).replace(tzinfo=None)
+            current_hash = _hash_payload(
+                prev_hash, i, log["operator"], log["action"], log["target"], log["detail"],
+                created.isoformat(), log["evidence_refs"],
+            )
             log_id = f"LOG-INIT-{i:04d}"
             await conn.execute(
                 """INSERT INTO audit_log (log_id, seq, operator, action, target, detail, evidence_refs, prev_hash, current_hash, created_at)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,now())""",
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)""",
                 log_id, i, log["operator"], log["action"], log["target"], log["detail"],
-                log["evidence_refs"], prev_hash, current_hash,
+                log["evidence_refs"], prev_hash, current_hash, created,
             )
             prev_hash = current_hash
 
         # 7. 验证
         counts = {}
         for t in ["users","source_systems","deviations","evidence","timeline_events","five_whys","skeptic_challenges","audit_log"]:
-            r = await conn.fetchval(f"SELECT count(*) FROM {t}")
+            r = await conn.fetchval(f"SELECT count(*) FROM {t}")  # nosec B608 — 表名来自上方硬编码白名单
             counts[t] = r
-        print(f"[seed] 完成 ✓ 表行数: {counts}")
+        print(f"[seed] 完成 表行数: {counts}")
 
     finally:
         await conn.close()

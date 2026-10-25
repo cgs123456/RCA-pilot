@@ -31,6 +31,8 @@ class ErrorCode(str, Enum):
     ROLE_INSUFFICIENT = "E4031"  # 角色不足
     ACCOUNT_LOCKED = "E4013"  # 账号锁定
     ACCOUNT_DISABLED = "E4014"  # 账号禁用
+    MFA_REQUIRED = "E4015"  # 需要 TOTP 动态验证码
+    MFA_CODE_INVALID = "E4016"  # TOTP 动态验证码错误
 
     # ============================================================
     # 业务错误 2xxx
@@ -84,6 +86,8 @@ ERROR_HTTP_STATUS = {
     ErrorCode.ROLE_INSUFFICIENT: 403,
     ErrorCode.ACCOUNT_LOCKED: 401,
     ErrorCode.ACCOUNT_DISABLED: 401,
+    ErrorCode.MFA_REQUIRED: 401,
+    ErrorCode.MFA_CODE_INVALID: 401,
     ErrorCode.CASE_NOT_FOUND: 404,
     ErrorCode.CASE_ALREADY_CLOSED: 400,
     ErrorCode.CASE_STATUS_TRANSITION_INVALID: 400,

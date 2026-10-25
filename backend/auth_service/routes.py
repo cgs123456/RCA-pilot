@@ -25,6 +25,9 @@ from shared.schemas import (
     LoginRequest,
     RefreshRequest,
     TokenResponse,
+    TotpCodeRequest,
+    TotpDisableRequest,
+    TotpSetupResponse,
     UserOut,
 )
 from shared.security import (
@@ -36,6 +39,7 @@ from shared.security import (
     revoke_jti,
     verify_password,
 )
+from shared.totp import generate_secret, provisioning_uri, verify_totp
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -67,7 +71,8 @@ async def login(
     - 成功后重置失败计数并记录 last_login_at
     - 写入 LOGIN_SUCCESS 审计日志
     """
-    result = await db.execute(select(User).where(User.email == body.email))
+    # 行锁防并发丢失更新：并发登录各自读旧值 +1 会漏计失败次数（5 次锁定形同虚设）
+    result = await db.execute(select(User).where(User.email == body.email).with_for_update())
     user = result.scalar_one_or_none()
 
     ip = get_client_ip(request)
@@ -140,6 +145,35 @@ async def login(
     user.locked_until = None
     user.last_login_at = datetime.now(UTC)
 
+    # P3-④ TOTP 第二因子：已启用（种子存在且已激活）则必须携带有效动态验证码。
+    # 验证失败计入 failed_login_attempts（不触发锁定——6 位码单窗口仅 ±1 共 3 个
+    # 候选时间片，配合登录限流已足够；避免与密码失败共享锁定语义造成误锁）。
+    mfa_detail = ""
+    if user.totp_secret and not user.totp_pending:
+        if not body.mfa_code:
+            raise AuthError(
+                "该账号已启用两步验证，请输入动态验证码",
+                error_code=ErrorCode.MFA_REQUIRED.value,
+                details={"mfa_required": True},
+            )
+        matched_step = verify_totp(
+            user.totp_secret, body.mfa_code, last_used_step=user.totp_last_step or 0
+        )
+        if matched_step is None:
+            user.failed_login_attempts += 1
+            await append_audit_log(
+                db,
+                operator=user.email,
+                action="MFA_FAILED",
+                target=user.id,
+                detail=f"动态验证码错误 (第 {user.failed_login_attempts} 次)",
+                ip_address=ip,
+            )
+            await db.commit()
+            raise AuthError("动态验证码错误", error_code=ErrorCode.MFA_CODE_INVALID.value)
+        user.totp_last_step = matched_step  # 防同窗口重放
+        mfa_detail = "，动态验证码校验通过"
+
     access = create_access_token(
         subject=user.id,
         claims={
@@ -155,7 +189,7 @@ async def login(
         operator=user.email,
         action="LOGIN_SUCCESS",
         target=user.id,
-        detail=f"{user.name} ({user.role}) 登录成功",
+        detail=f"{user.name} ({user.role}) 登录成功{mfa_detail}",
         ip_address=ip,
         session_id=decode_token(access).get("jti", ""),
     )
@@ -196,12 +230,23 @@ async def refresh(
             detail="已轮换的 refresh token 被重放",
             ip_address=get_client_ip(request),
         )
+        # 审计必须先提交——AuthError 会触发 get_db 统一回滚，安全事件留痕不能丢
+        await db.commit()
         raise AuthError("Refresh token 已失效，请重新登录", error_code=ErrorCode.TOKEN_INVALID.value)
 
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
     if not user or not user.is_active:
         raise AuthError("用户不存在或已禁用", error_code=ErrorCode.ACCOUNT_DISABLED.value)
+
+    # 锁定中的账号即使持有未过期的 refresh token 也不能续期（与登录锁定语义一致）
+    remaining = _lock_remaining_seconds(user)
+    if remaining > 0:
+        raise AuthError(
+            f"账号已锁定（约 {remaining // 60 + 1} 分钟后自动解锁），请稍后再试",
+            error_code=ErrorCode.ACCOUNT_LOCKED.value,
+            details={"retry_after_seconds": remaining},
+        )
 
     access = create_access_token(
         subject=user.id,
@@ -272,3 +317,116 @@ async def logout(
         session_id=auth.session_id,
     )
     return {"status": "ok", "message": "已登出"}
+
+
+# ============================================================
+# P3-④ TOTP 两步验证注册/激活/停用
+# ============================================================
+
+@router.get("/totp/status", summary="当前用户 TOTP 启用状态")
+async def totp_status(
+    auth: AuthContext = Depends(get_auth_context),
+) -> dict:
+    """enabled=True 时登录要求动态验证码；pending=True 表示有未完成的注册"""
+    user = auth.user
+    return {
+        "enabled": bool(user.totp_secret) and not user.totp_pending,
+        "pending": bool(user.totp_secret) and bool(user.totp_pending),
+    }
+
+
+@router.post("/totp/setup", response_model=TotpSetupResponse, summary="开始注册 TOTP（生成种子）")
+async def totp_setup(
+    auth: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db_from_auth),
+) -> TotpSetupResponse:
+    """生成 TOTP 种子并进入待激活状态
+
+    种子写入 users.totp_secret 且 totp_pending=True —— 在 activate 校验成功之前
+    不参与登录校验（防止用户扫码失败后把自己锁死）。已启用的用户须先停用。
+    """
+    user = auth.user
+    if user.totp_secret and not user.totp_pending:
+        raise AuthError("该账号已启用两步验证，如需重置请先停用", error_code=ErrorCode.BUSINESS_VALIDATION_ERROR.value)
+    secret = generate_secret()
+    user.totp_secret = secret
+    user.totp_pending = True
+    user.totp_last_step = 0
+    await append_audit_log(
+        db,
+        operator=auth.email,
+        action="MFA_SETUP_CREATED",
+        target=auth.user_id,
+        detail=f"{auth.user.name} 发起 TOTP 注册（待激活）",
+        ip_address=auth.ip_address,
+        session_id=auth.session_id,
+    )
+    return TotpSetupResponse(secret=secret, otpauth_uri=provisioning_uri(secret, user.email))
+
+
+@router.post("/totp/activate", summary="验证一次动态验证码完成激活")
+async def totp_activate(
+    body: TotpCodeRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db_from_auth),
+) -> dict:
+    """校验注册中的种子对应当前时间片的码，成功则 TOTP 正式生效"""
+    user = auth.user
+    if not user.totp_secret or not user.totp_pending:
+        raise AuthError("当前没有待激活的 TOTP 注册", error_code=ErrorCode.BUSINESS_VALIDATION_ERROR.value)
+    matched_step = verify_totp(user.totp_secret, body.code, last_used_step=0)
+    if matched_step is None:
+        await append_audit_log(
+            db,
+            operator=auth.email,
+            action="MFA_ACTIVATION_FAILED",
+            target=auth.user_id,
+            detail="TOTP 激活码校验失败",
+            ip_address=auth.ip_address,
+        )
+        await db.commit()
+        raise AuthError("动态验证码错误，请确认认证器时间同步", error_code=ErrorCode.MFA_CODE_INVALID.value)
+    user.totp_pending = False
+    # 记 matched_step-1 而非 matched_step：激活码在其时间片剩余秒数内仍可用于
+    # 第一次登录（否则同一 30s 窗口内激活→登录会被防重放误拒）；之后严格递增。
+    user.totp_last_step = max(0, matched_step - 1)
+    await append_audit_log(
+        db,
+        operator=auth.email,
+        action="MFA_ACTIVATED",
+        target=auth.user_id,
+        detail=f"{auth.user.name} 的 TOTP 两步验证已生效",
+        ip_address=auth.ip_address,
+        session_id=auth.session_id,
+    )
+    return {"status": "ok", "message": "两步验证已启用"}
+
+
+@router.post("/totp/disable", summary="停用 TOTP（需验证登录密码）")
+async def totp_disable(
+    body: TotpDisableRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db_from_auth),
+) -> dict:
+    """关闭第二因子 —— 必须验证登录密码，防止会话被劫持后静默关闭"""
+    user = auth.user
+    if not user.password_hash:
+        raise AuthError("该账号未启用密码登录，无法在此停用 TOTP", error_code=ErrorCode.BUSINESS_VALIDATION_ERROR.value)
+    password_ok = await anyio.to_thread.run_sync(verify_password, body.password, user.password_hash)
+    if not password_ok:
+        raise AuthError("密码错误", error_code=ErrorCode.SIGNATURE_PASSWORD_WRONG.value)
+    if not user.totp_secret:
+        raise AuthError("该账号未启用两步验证", error_code=ErrorCode.BUSINESS_VALIDATION_ERROR.value)
+    user.totp_secret = None
+    user.totp_pending = False
+    user.totp_last_step = 0
+    await append_audit_log(
+        db,
+        operator=auth.email,
+        action="MFA_DISABLED",
+        target=auth.user_id,
+        detail=f"{auth.user.name} 停用了 TOTP 两步验证（密码验证通过）",
+        ip_address=auth.ip_address,
+        session_id=auth.session_id,
+    )
+    return {"status": "ok", "message": "两步验证已停用"}

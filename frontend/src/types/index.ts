@@ -7,6 +7,22 @@ export type CaseStatus = 'pending' | 'investigating' | 'reviewing' | 'closed';
 export type HitlGateStatus = 'pending' | 'done' | 'rejected';
 export type HitlAction = 'accept' | 'reject' | 'edit';
 export type SourceSystem = 'LIMS' | 'MES' | 'EMS' | 'CMMS' | 'LMS' | 'BMS';
+/** P2-⑧ 偏差类型（与后端 DeviationType 对齐：OOS=检验结果超标 / OOT=趋势外） */
+export type DeviationType =
+  | 'process_deviation'
+  | 'lab_oos'
+  | 'lab_oot'
+  | 'complaint'
+  | 'equipment'
+  | 'environment'
+  | 'other';
+
+/** ICH Q9 FMEA 三分量（与后端 FmeaScores 对齐：RPN = S×O×D，各 1-10） */
+export interface FmeaScores {
+  severity_score: number;
+  occurrence: number;
+  detection: number;
+}
 
 export interface User {
   id: string;
@@ -42,6 +58,8 @@ export interface Deviation {
   description?: string;
   severity: Severity;
   status: CaseStatus;
+  deviation_type: DeviationType;
+  affected_batches: string[];
   case_type?: string;
   complexity: number;
   location?: string;
@@ -56,6 +74,11 @@ export interface Deviation {
   product_impact?: string;
   immediate_action?: string;
   progress: number;
+  closed_at?: string;
+  /** ICH Q9 风险评估（PATCH /cases/{id}/risk 维护；创建含 fmea 时初始化） */
+  risk_rpn?: number;
+  risk_category?: string;
+  risk_owner?: string;
   hitl_gates: Record<string, HitlGateStatus>;
   meta: Record<string, unknown>;
   created_at: string;
@@ -144,7 +167,9 @@ export interface AuditLog {
   session_id?: string;
   evidence_refs: string[];
   ai_model?: string;
+  ai_prompt_hash?: string;
   ai_output_hash?: string;
+  trace_id?: string;
   prev_hash: string;
   current_hash: string;
   created_at: string;

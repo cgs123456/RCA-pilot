@@ -17,12 +17,14 @@ from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import event, select
+from sqlalchemy.exc import IntegrityError as SAIntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from shared.auth_middleware import AuthContext
 from shared.database import Base
 from shared.models import (
+    Capa,
     Deviation,
     FiveWhy,
     SignatureRecord,
@@ -136,6 +138,21 @@ async def tochar_db(tochar_engine) -> AsyncGenerator[AsyncSession, None]:
         await session.commit()
         yield session
         await session.rollback()
+
+
+@pytest.fixture
+async def fk_engine():
+    """强制外键的 SQLite 引擎 —— 默认 test_db 不开 PRAGMA，无法触发 FK 违反分支"""
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _fk_on(dbapi_conn, _rec):
+        dbapi_conn.execute("PRAGMA foreign_keys=ON")
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield engine
+    await engine.dispose()
 
 
 # ============================================================
@@ -326,6 +343,44 @@ class TestCreateCase:
             auth=ctx,
         )
         assert r.id == "DEV-NEW-1"
+
+    async def test_fk_violation_missing_user(self, fk_engine):
+        """investigator_id 指向不存在用户 → 立即 422，而非空转重试 5 次后误报 ID 冲突"""
+        from shared.exceptions import ValidationError
+        from shared.security import hash_password
+
+        factory = async_sessionmaker(
+            fk_engine, class_=AsyncSession, expire_on_commit=False, autoflush=False
+        )
+        async with factory() as db:
+            db.add(
+                User(
+                    id="U-LC",
+                    email="lisa.chen@demo.local",
+                    name="Lisa Chen",
+                    role="investigator",
+                    password_hash=hash_password("rca-demo-2025"),
+                    is_active=True,
+                )
+            )
+            await db.commit()
+            lc = (await db.execute(select(User).where(User.id == "U-LC"))).scalar_one()
+            _ = lc.id, lc.email, lc.role  # 预加载属性，防 rollback 后惰性加载 MissingGreenlet
+            db.expunge(lc)
+            ctx = _ctx(lc, db)
+            with pytest.raises(ValidationError, match="关联的用户不存在"):
+                await routes.create_case(
+                    request=None,
+                    body=DeviationCreate(
+                        id="DEV-FK-001",
+                        title="关联用户不存在案例标题",
+                        severity="minor",
+                        discovered_at=datetime.now(UTC),
+                        investigator_id="U-GHOST",
+                    ),
+                    db=db,
+                    auth=ctx,
+                )
 
 
 # ============================================================
@@ -690,10 +745,10 @@ def db_add_fw(db, fw_id, case_id, n, question, answer):
 
 
 # ============================================================
-#  _trigger_pipeline_retry —— 异常分支降级
+#  _trigger_pipeline_retry —— 派发结果三态（dispatched/skipped/failed）
 # ============================================================
 class TestTriggerPipelineRetry:
-    async def test_exception_swallowed(self, test_db: AsyncSession, monkeypatch):
+    async def test_exception_returns_failed(self, test_db: AsyncSession, monkeypatch):
         from shared.config import settings
 
         async def _boom(*args, **kwargs):
@@ -701,14 +756,67 @@ class TestTriggerPipelineRetry:
 
         monkeypatch.setattr(settings, "service_api_key", "secret-key")
         monkeypatch.setattr("httpx.AsyncClient.post", _boom)
-        # 不应抛出异常 ——— 网络失败留给审计处理
-        await routes._trigger_pipeline_retry(case_id="DEV-1", operator="admin@x.com")
+        # B11：网络失败不抛出 —— 返回 failed 由调用方显式审计
+        result = await routes._trigger_pipeline_retry(
+            case_id="DEV-1", operator="admin@x.com"
+        )
+        assert result == "failed"
 
-    async def test_no_api_key_returns(self, test_db: AsyncSession, monkeypatch):
+    async def test_no_api_key_returns_skipped(self, test_db: AsyncSession, monkeypatch):
         from shared.config import settings
 
         monkeypatch.setattr(settings, "service_api_key", "")
-        await routes._trigger_pipeline_retry(case_id="DEV-1", operator="a@b.com")
+        result = await routes._trigger_pipeline_retry(
+            case_id="DEV-1", operator="a@b.com"
+        )
+        assert result == "skipped"
+
+    async def test_http_success_returns_dispatched(self, test_db: AsyncSession, monkeypatch):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from shared.config import settings
+
+        mock_response = MagicMock(status_code=200)
+        mock_response.raise_for_status = MagicMock()
+        mock_client = MagicMock()
+        mock_client.post = AsyncMock(return_value=mock_response)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        monkeypatch.setattr(settings, "service_api_key", "secret-key")
+        monkeypatch.setattr("httpx.AsyncClient", MagicMock(return_value=mock_client))
+
+        result = await routes._trigger_pipeline_retry(
+            case_id="DEV-1", operator="a@b.com"
+        )
+        assert result == "dispatched"
+        assert mock_client.post.call_args.kwargs["headers"]["X-Service-Key"] == "secret-key"
+
+    async def test_http_5xx_returns_failed(self, test_db: AsyncSession, monkeypatch):
+        from unittest.mock import AsyncMock, MagicMock
+
+        import httpx as _httpx
+
+        from shared.config import settings
+
+        mock_response = MagicMock(status_code=500)
+        mock_response.raise_for_status = MagicMock(
+            side_effect=_httpx.HTTPStatusError(
+                "500 Internal Server Error",
+                request=MagicMock(),
+                response=MagicMock(status_code=500),
+            )
+        )
+        mock_client = MagicMock()
+        mock_client.post = AsyncMock(return_value=mock_response)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        monkeypatch.setattr(settings, "service_api_key", "secret-key")
+        monkeypatch.setattr("httpx.AsyncClient", MagicMock(return_value=mock_client))
+
+        result = await routes._trigger_pipeline_retry(
+            case_id="DEV-1", operator="a@b.com"
+        )
+        assert result == "failed"
 
 
 # ============================================================
@@ -727,8 +835,15 @@ class TestUpdateFiveWhy:
             )
 
     async def test_update_fields(self, test_db: AsyncSession, seed_db):
+        from shared.models import Evidence
+
         c = await _case(test_db, id="DEV-FW-1")
         db_add_fw(test_db, "FW-1", c.id, 1, "为什么?", "因为 A")
+        # update_five_why 现校验 evidence_ids 必须属于本案例 —— 预置一条真实证据
+        test_db.add(Evidence(
+            id="E-1", case_id=c.id, source_system="MES",
+            collected_at=datetime.now(UTC), content_hash="sha256:test",
+        ))
         await test_db.commit()
         lc = (await _user(test_db, "U-LC"))
         ctx = _ctx(lc, test_db)
@@ -1084,12 +1199,24 @@ class TestGetKpi:
             deadline=(last_month + timedelta(days=10)),
         )
         lc = (await _user(test_db, "U-LC"))
+        # capa_overdue_rate 现按 CAPA 实体口径（3.2-1 对齐）：2 条 open CAPA、1 条逾期
+        test_db.add(Capa(
+            id="CAPA-KPI-1", case_id="DEV-KPI-2", title="逾期 CAPA",
+            severity="major", responsibility="生产部", status="implemented",
+            due_date=now - timedelta(days=1), created_at=now,
+        ))
+        test_db.add(Capa(
+            id="CAPA-KPI-2", case_id="DEV-KPI-2", title="未逾期 CAPA",
+            severity="minor", responsibility="QA", status="pending",
+            due_date=now + timedelta(days=10), created_at=now,
+        ))
+        await test_db.commit()
         ctx = _ctx(lc, test_db)
         r = await routes.get_kpi(request=None, db=test_db, _=ctx)
         # 未解决 = 非 closed（DEV-KPI-2, DEV-KPI-3）
         assert r.unsolved_count == 2
         assert r.major_count_this_month >= 1
-        assert r.capa_overdue_rate > 0
+        assert r.capa_overdue_rate == 0.5
         assert isinstance(r.avg_cycle_days, float)
         assert isinstance(r.trend_unsolved_delta, int)
         assert isinstance(r.trend_major_delta, int)
@@ -1155,4 +1282,64 @@ class TestListSourceSystems:
         ctx = _ctx(lc, test_db)
         r = await routes.list_source_systems(request=None, db=test_db, _=ctx)
         codes = [s.code for s in r]
-        assert codes == ["EMS", "LIMS", "MES"]
+        assert codes == ["EMS", "LIMS", "MES"]
+
+
+# ============================================================
+#  消融实验 E1 —— is_unique_violation 判别式各信号必要性
+#  （真 PG15 探针实证：本地化消息下仅类名信号可判；SQLite 仅消息可判）
+# ============================================================
+class TestUniqueViolationClassifier:
+    def test_pg_unique_via_class_name_despite_localized_message(self):
+        """消融：PG lc_messages 非 English —— 消息不含 "unique constraint"、
+        diag.constraint_name 为 None，唯一可用信号是异常类名。"""
+        import psycopg2.errors
+
+        from case_service.routes import is_unique_violation
+
+        e = psycopg2.errors.UniqueViolation('重复键违反唯一约束 "deviations_pkey"')
+        assert is_unique_violation(e, Exception("任意包装消息")) is True
+
+    def test_sqlite_unique_via_message_only(self):
+        """消融：SQLite 异常类是普通 IntegrityError（类名信号缺席）——
+        唯一可用信号是消息文本，证明消息项必要。"""
+        import sqlite3
+
+        from case_service.routes import is_unique_violation
+
+        e = sqlite3.IntegrityError("UNIQUE constraint failed: deviations.id")
+        assert is_unique_violation(e, e) is True
+
+    def test_sqlite_fk_not_unique(self):
+        import sqlite3
+
+        from case_service.routes import is_unique_violation
+
+        e = sqlite3.IntegrityError("FOREIGN KEY constraint failed")
+        assert is_unique_violation(e, e) is False
+
+    def test_pg_fk_not_unique(self):
+        import psycopg2.errors
+
+        from case_service.routes import is_unique_violation
+
+        e = psycopg2.errors.ForeignKeyViolation(
+            'insert or update on table "deviations" violates foreign key '
+            'constraint "deviations_investigator_id_fkey"'
+        )
+        assert is_unique_violation(e, Exception()) is False
+
+    def test_sqlalchemy_wrapped_orig_shape(self):
+        """路由实际捕获形态：sqlalchemy.exc.IntegrityError.orig = DBAPI 异常。"""
+        import sqlite3
+
+        from case_service.routes import is_unique_violation
+
+        orig = sqlite3.IntegrityError("UNIQUE constraint failed: deviations.id")
+        sa_err = SAIntegrityError("INSERT INTO deviations ...", None, orig)
+        assert is_unique_violation(sa_err.orig, sa_err) is True
+
+    def test_none_orig_falls_back_to_message(self):
+        from case_service.routes import is_unique_violation
+
+        assert is_unique_violation(None, Exception("UNIQUE constraint failed: t.id")) is True

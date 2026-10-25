@@ -11,13 +11,15 @@ from typing import Any
 import httpx
 from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import desc, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.audit import append_audit_log
 from shared.auth_middleware import AuthContext, get_db_from_auth, require
 from shared.config import settings
+from shared.database import release_db_connection
 from shared.exceptions import ConnectorError, NotFoundError, ValidationError
-from shared.models import Evidence, TimelineEvent
+from shared.models import Deviation, Evidence, TimelineEvent
 from shared.rate_limit import api_limit, write_limit
 from shared.schemas import EvidenceOut, Page, TimelineEventOut
 from shared.vector_store import search_evidence
@@ -185,29 +187,44 @@ async def _persist_fetched_evidence(
     case_id: str | None,
     items: list[dict[str, Any]],
 ) -> int:
-    """证据落库（content_hash 去重，内容寻址 ID 天然幂等）。返回新增条数。"""
+    """证据落库（content_hash 去重，内容寻址 ID 天然幂等）。返回新增条数。
+
+    并发安全：两条相同内容的并发拉取会得到相同 ID（E-{source}-{hash}），
+    exists 检查拦不住检查窗口内的竞态 —— 用 SAVEPOINT 捕获主键冲突后幂等跳过，
+    而不是让事务末尾的 commit 炸出 500。
+    """
     new_count = 0
     now = datetime.now(UTC)
+    seen_hashes: set[str] = set()  # 批内去重：同一响应里重复的条目只落一次
     for item in items:
         chash = _content_hash(source, item)
+        if chash in seen_hashes:
+            continue
+        seen_hashes.add(chash)
         ev_id = f"E-{source}-{chash.split(':', 1)[1][:10]}"
         exists = (await db.execute(
             select(func.count()).select_from(Evidence).where(Evidence.id == ev_id)
         )).scalar_one()
         if exists:
             continue
-        db.add(Evidence(
-            id=ev_id,
-            case_id=case_id,
-            source_system=source,
-            collected_at=_collected_at_of(item),
-            summary=_summary_of(source, item),
-            raw_data=item,
-            content_hash=chash,
-            confidence=3,
-            is_signed=False,
-            created_at=now,
-        ))
+        try:
+            async with db.begin_nested():
+                db.add(Evidence(
+                    id=ev_id,
+                    case_id=case_id,
+                    source_system=source,
+                    collected_at=_collected_at_of(item),
+                    summary=_summary_of(source, item),
+                    raw_data=item,
+                    content_hash=chash,
+                    confidence=3,
+                    is_signed=False,
+                    created_at=now,
+                ))
+                await db.flush()
+        except IntegrityError:
+            # 并发竞态：另一请求已插入同 ID（内容相同）—— 幂等跳过
+            continue
         new_count += 1
     return new_count
 
@@ -231,12 +248,22 @@ async def fetch_from_source(
     if source not in ("LMS", "BMS", "EMS", "MES", "LIMS", "CMMS"):
         raise ConnectorError(f"不支持的源系统: {source}")
 
-    # Connector URL + 默认拉取路径映射（每个 Connector 的入口端点）
+    # case_id 必须存在 —— 否则证据带悬挂外键落库，事务末尾才炸 500
+    if case_id is not None:
+        case_exists = (
+            await db.execute(select(Deviation.id).where(Deviation.id == case_id))
+        ).scalar_one_or_none()
+        if case_exists is None:
+            raise NotFoundError(f"案例 {case_id} 不存在")
+
+    # Connector URL + 默认拉取路径映射（每个 Connector 的入口端点）。
+    # 路径必须与 connectors/{lms,bms,ems,mes}/routes.py 的实际挂载路径
+    # （/api/v1/{prefix}/...）逐字一致 —— 历史上漏过 /api/v1 前缀导致线上 404。
     connector_map = {
-        "LMS": (settings.lms_connector_url, "/lms/cert-status"),
-        "BMS": (settings.bms_connector_url, "/bms/ahus"),
-        "EMS": (settings.ems_connector_url, "/ems/exceedances"),
-        "MES": (settings.mes_connector_url, "/mes/cctv/anomalies"),
+        "LMS": (settings.lms_connector_url, "/api/v1/lms/cert-status"),
+        "BMS": (settings.bms_connector_url, "/api/v1/bms/ahus"),
+        "EMS": (settings.ems_connector_url, "/api/v1/ems/exceedances"),
+        "MES": (settings.mes_connector_url, "/api/v1/mes/cctv/anomalies"),
     }
     entry = connector_map.get(source)
     if not entry or not entry[0]:
@@ -332,11 +359,15 @@ async def embed_evidence(
                 "message": "LLM embedding 未配置，跳过向量化",
                 "embedding_model": None,
             }
+        # C3：embedding API 调用可能耗时数秒，先归还 DB 连接
+        # （ev 已读入内存，expire_on_commit=False 保证提交后属性仍可读写）
+        await release_db_connection(db)
         embedding = await llm_client.embed_text(ev.summary)
     except LLMError as e:
         raise ValidationError(f"Embedding 生成失败: {e}") from e
 
     ev.embedding = embedding
+    ev.embedding_vec = embedding  # pgvector 检索副本（bind_expression 自带 CAST）
     ev.embedding_model = llm_client.embedding_model_name
     ev.embedded_at = datetime.now(UTC)
 
@@ -389,57 +420,71 @@ async def embed_evidence_batch(
 
     model_name = llm_client.embedding_model_name
 
-    # 查找待嵌入证据：未嵌入 或 模型不一致（模型切换后需要重嵌）
-    stmt = (
-        select(Evidence)
-        .where(Evidence.summary.isnot(None))
-        .where(
-            or_(
-                Evidence.embedding.is_(None),
-                Evidence.embedding_model.is_(None),
-                Evidence.embedding_model != model_name,
-            )
-        )
-        .order_by(Evidence.created_at.desc())
-    )
-    if case_id:
-        stmt = stmt.where(Evidence.case_id == case_id)
-    stmt = stmt.limit(limit)
-    # PG 行锁：并发批量请求不会重复嵌入同一批；SQLite（测试）忽略 FOR UPDATE
-    stmt = stmt.with_for_update(skip_locked=True)
-    evidences = (await db.execute(stmt)).scalars().all()
-
-    if not evidences:
-        return {"status": "ok", "embedded_count": 0, "message": "无待嵌入证据"}
-
-    # 按 64 条分批调用（Qwen/GLM/OpenAI 兼容接口单批上限差异较大，64 为稳妥值）
-    embeddings: list[list[float]] = []
-    for i in range(0, len(evidences), EMBED_BATCH_SIZE):
-        chunk = [s for s in (ev.summary for ev in evidences[i:i + EMBED_BATCH_SIZE]) if s is not None]
-        try:
-            embeddings.extend(await llm_client.embed_texts(chunk))
-        except LLMError as e:
-            raise ValidationError(f"批量嵌入失败（第 {i // EMBED_BATCH_SIZE + 1} 批）: {e}") from e
-
+    # C3 逐批短事务：每轮 SELECT（SKIP LOCKED 行锁）→ embed → 写入 → commit，
+    # 行锁与池连接的持有时间从「全量 limit(≤500) 行 + 全部 embed 耗时」缩到「单批 ≤64 行」；
+    # commit 后下一轮的 or_ 条件自然排除已嵌入行，循环必然收敛。
+    # LLM await 期间仍持有该批行锁（先锁后算防重复嵌入），但范围仅 ≤64 行。
     now = datetime.now(UTC)
-    for ev, emb in zip(evidences, embeddings, strict=False):
-        ev.embedding = emb
-        ev.embedding_model = model_name
-        ev.embedded_at = now
+    processed = 0
+    max_rounds = (limit + EMBED_BATCH_SIZE - 1) // EMBED_BATCH_SIZE + 1
+    for _ in range(max_rounds):
+        batch_size = min(EMBED_BATCH_SIZE, limit - processed)
+        stmt = (
+            select(Evidence)
+            .where(Evidence.summary.isnot(None))
+            .where(
+                or_(
+                    Evidence.embedding.is_(None),
+                    Evidence.embedding_model.is_(None),
+                    Evidence.embedding_model != model_name,
+                )
+            )
+            .order_by(Evidence.created_at.desc())
+        )
+        if case_id:
+            stmt = stmt.where(Evidence.case_id == case_id)
+        stmt = stmt.limit(batch_size)
+        # PG 行锁：并发批量请求不会重复嵌入同一批；SQLite（测试）忽略 FOR UPDATE
+        stmt = stmt.with_for_update(skip_locked=True)
+        evidences = (await db.execute(stmt)).scalars().all()
+
+        if not evidences:
+            break
+
+        chunk = [s for s in (ev.summary for ev in evidences) if s is not None]
+        try:
+            embeddings = await llm_client.embed_texts(chunk)
+        except LLMError as e:
+            raise ValidationError(
+                f"批量嵌入失败（第 {processed // EMBED_BATCH_SIZE + 1} 批）: {e}"
+            ) from e
+
+        for ev, emb in zip(evidences, embeddings, strict=False):
+            ev.embedding = emb
+            ev.embedding_vec = emb  # pgvector 检索副本（bind_expression 自带 CAST）
+            ev.embedding_model = model_name
+            ev.embedded_at = now
+
+        # 提交本批：写入 + 释放行锁 + 归还池连接（expire_on_commit=False，对象属性保留）
+        await db.commit()
+        processed += len(evidences)
+
+    if processed == 0:
+        return {"status": "ok", "embedded_count": 0, "message": "无待嵌入证据"}
 
     await append_audit_log(
         db,
         operator=auth.email,
         action="EVIDENCE_EMBED_BATCH",
         target=case_id or "*",
-        detail=f"批量向量化 {len(evidences)} 条证据（model={model_name}）",
+        detail=f"批量向量化 {processed} 条证据（model={model_name}）",
         ip_address=auth.ip_address,
         session_id=auth.session_id,
     )
 
     return {
         "status": "ok",
-        "embedded_count": len(evidences),
+        "embedded_count": processed,
         "embedding_model": model_name,
         "embedded_at": now.isoformat(),
     }
@@ -468,6 +513,8 @@ async def semantic_search(
     from shared.llm_client import LLMError, llm_client
     if llm_client.supports_embeddings:
         try:
+            # C3：查询向量生成可能耗时数秒，先归还 DB 连接（本端点只读）
+            await release_db_connection(db)
             query_embedding = await llm_client.embed_text(q)
             search_mode = "semantic"
         except LLMError as e:
@@ -478,6 +525,7 @@ async def semantic_search(
         db, query=q, top_k=top_k,
         exclude_case_id=exclude_case_id,
         query_embedding=query_embedding,
+        embedding_model=llm_client.embedding_model_name,
     )
 
     return {
@@ -522,6 +570,8 @@ async def find_related_cases(
     embedding_error = None
     if llm_client.supports_embeddings:
         try:
+            # C3：查询向量生成前归还 DB 连接（本端点只读）
+            await release_db_connection(db)
             query_embedding = await llm_client.embed_text(q)
         except LLMError as e:
             embedding_error = str(e)
@@ -530,6 +580,7 @@ async def find_related_cases(
         db, query=q, top_k=top_k,
         exclude_case_id=exclude_case_id,
         query_embedding=query_embedding,
+        embedding_model=llm_client.embedding_model_name,
     )
 
     return {

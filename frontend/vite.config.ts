@@ -13,41 +13,14 @@ export default defineConfig({
     port: 5173,
     host: true,
     proxy: {
-      // 统一 /api/v1 前缀，按服务名路由到不同后端
-      '/api/v1/auth': {
-        target: 'http://localhost:8001',
-        changeOrigin: true,
-      },
-      '/api/v1/cases': {
-        target: 'http://localhost:8002',
-        changeOrigin: true,
-      },
-      '/api/v1/dashboard': {
-        target: 'http://localhost:8002',
-        changeOrigin: true,
-      },
-      '/api/v1/source-systems': {
-        target: 'http://localhost:8002',
-        changeOrigin: true,
-      },
-      '/api/v1/evidence': {
-        target: 'http://localhost:8003',
-        changeOrigin: true,
-      },
-      '/api/v1/timeline': {
-        target: 'http://localhost:8003',
-        changeOrigin: true,
-      },
+      // P3-① 收敛后仅两个后端单元：core-service(8000, auth+case+evidence+audit+capa/报告/通知)
+      // 与 agent-service(8004, LLM 长任务)；与 deploy/nginx.conf 路由口径一致。
       '/api/v1/agent': {
         target: 'http://localhost:8004',
         changeOrigin: true,
       },
-      '/api/v1/audit': {
-        target: 'http://localhost:8005',
-        changeOrigin: true,
-      },
-      '/api/v1/lms': {
-        target: 'http://localhost:8011',
+      '/api/v1': {
+        target: 'http://localhost:8000',
         changeOrigin: true,
       },
     },

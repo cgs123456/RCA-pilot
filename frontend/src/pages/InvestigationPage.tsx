@@ -336,8 +336,15 @@ export function InvestigationPage() {
 
       {/* 启动 Agent Modal */}
       {runAgentModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 animate-fade-in" onClick={() => setRunAgentModal(false)}>
-          <Card className="w-full max-w-md animate-scale-in" >
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 animate-fade-in"
+          onClick={() => setRunAgentModal(false)}
+          onKeyDown={(e) => { if (e.key === 'Escape') setRunAgentModal(false); }}
+          role="dialog"
+          aria-modal="true"
+          aria-label="启动 Agent 流水线"
+        >
+          <Card className="w-full max-w-md animate-scale-in" onClick={(e) => e.stopPropagation()}>
             <CardBody>
               <div className="flex items-center gap-2 mb-3">
                 <div className="w-10 h-10 rounded-md bg-brand-50 flex items-center justify-center">

@@ -11,42 +11,19 @@ x-dev-backend: &dev-backend
     DEBUG: "true"
 
 services:
-  auth-service:
+  # P3-① 架构收敛后仅三个后端单元
+  core-service:
     <<: *dev-backend
     ports:
-      - "8001:8001"
-  case-service:
-    <<: *dev-backend
-    ports:
-      - "8002:8002"
-  evidence-service:
-    <<: *dev-backend
-    ports:
-      - "8003:8003"
+      - "8000:8000"
   agent-service:
     <<: *dev-backend
     ports:
       - "8004:8004"
-  audit-service:
+  connector-gateway:
     <<: *dev-backend
     ports:
-      - "8005:8005"
-  lms-connector:
-    <<: *dev-backend
-    ports:
-      - "8011:8011"
-  bms-connector:
-    <<: *dev-backend
-    ports:
-      - "8012:8012"
-  ems-connector:
-    <<: *dev-backend
-    ports:
-      - "8013:8013"
-  mes-connector:
-    <<: *dev-backend
-    ports:
-      - "8014:8014"
+      - "8010:8010"
 
   # 本地开发需要直连数据库/Redis 时在此暴露（生产不暴露）
   postgres:

@@ -31,19 +31,19 @@ jobs:
 
     steps:
       - name: 检出代码
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: 安装 Python 3.11
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
           cache: pip
-          cache-dependency-path: backend/requirements.txt
+          cache-dependency-path: backend/requirements-dev.txt
 
       - name: 安装后端依赖
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
 
       - name: Ruff 静态检查
         run: ruff check .
@@ -75,27 +75,34 @@ jobs:
 
     steps:
       - name: 检出代码
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: 安装 Python 3.11
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
 
       - name: pip-audit 依赖 CVE 扫描（后端）
         run: |
           python -m pip install --upgrade pip pip-audit
-          # 以 requirements 为准扫描已知 CVE；发现高危即失败
-          pip-audit -r backend/requirements.txt --strict
+          # 以 requirements.lock（含全部传递依赖的哈希锁定版）为准扫描已知 CVE；发现高危即失败
+          pip-audit -r backend/requirements.lock --strict
 
       - name: Trivy 文件系统扫描（含配置与 secrets）
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: fs
           scan-ref: .
           severity: CRITICAL,HIGH
           exit-code: "1"
           ignore-unfixed: true
+
+      - name: Bandit SAST 静态安全扫描（后端）
+        run: |
+          python -m pip install --upgrade pip
+          pip install "bandit[toml]"
+          # -ll 只卡 Medium 及以上；B104（绑定 0.0.0.0）在 backend/pyproject.toml [tool.bandit] 中豁免
+          bandit -r backend -x backend/tests -ll -c backend/pyproject.toml
 
   # ============================================================
   # Job 3: 前端类型检查 + Lint + 构建
@@ -110,10 +117,10 @@ jobs:
 
     steps:
       - name: 检出代码
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: 安装 Node.js 20
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "20"
           cache: npm
@@ -132,7 +139,7 @@ jobs:
         run: npm run build
 
       - name: 上传构建产物 dist/
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: frontend-dist
           path: frontend/dist
@@ -149,7 +156,7 @@ jobs:
 
     services:
       postgres:
-        image: postgres:15-alpine
+        image: pgvector/pgvector:pg15  # 与 deploy compose 一致（0006 迁移需要 vector 扩展）
         env:
           POSTGRES_USER: rca
           POSTGRES_PASSWORD: rca-secret
@@ -177,20 +184,20 @@ jobs:
 
     steps:
       - name: 检出代码
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: 安装 Python 3.11
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
           cache: pip
-          cache-dependency-path: backend/requirements.txt
+          cache-dependency-path: backend/requirements-dev.txt
 
       - name: 安装后端依赖
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install alembic psycopg2-binary
+          # 与生产镜像同源：哈希锁定版（含 alembic/psycopg2），供应链一致
+          pip install --require-hashes -r requirements.lock
 
       - name: 应用迁移到 head
         run: alembic upgrade head

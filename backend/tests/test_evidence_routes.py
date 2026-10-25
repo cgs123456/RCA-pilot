@@ -50,7 +50,7 @@ from shared.auth_middleware import AuthContext, get_auth_context, get_db_from_au
 from shared.database import get_db
 from shared.exceptions import NotFoundError, ValidationError
 from shared.llm_client import LLMError
-from shared.models import AuditLog, Evidence, TimelineEvent, User
+from shared.models import AuditLog, Deviation, Evidence, TimelineEvent, User
 from shared.security import ROLE_PERMISSIONS
 
 LISA_EMAIL = "lisa.chen@biopharma.com"  # investigator —— evidence:read + evidence:write
@@ -137,6 +137,8 @@ async def operator_user(test_db: AsyncSession, seed_db) -> User:
 @pytest.fixture
 async def evidence_env(test_db: AsyncSession, seed_db) -> dict:
     """种子数据：3 条证据（两个案例）+ 3 条时间线事件（验证排序）"""
+    # 证据挂在存在的案例下（fetch-from-source 会校验 case_id 存在）
+    test_db.add_all([_deviation("DEV-LIST-A"), _deviation("DEV-LIST-B")])
     rows = [
         Evidence(
             id="E-LIST-01",
@@ -254,6 +256,19 @@ def _lms_evidence(eid: str, case_id: str, raw_data: dict) -> Evidence:
         raw_data=raw_data,
         content_hash=f"sha256:{eid}",
         confidence=3,
+    )
+
+
+def _deviation(cid: str) -> Deviation:
+    """fetch-from-source 带 case_id 时端点会校验案例存在 —— 先建最小案例"""
+    return Deviation(
+        id=cid,
+        title=f"测试案例 {cid}",
+        severity="minor",
+        status="investigating",
+        discovered_at=datetime.now(UTC),
+        hitl_gates={g: "pending" for g in ("gate1", "gate2", "gate3", "gate4", "gate5")},
+        progress=0,
     )
 
 
@@ -596,6 +611,7 @@ class TestFetchFromSource:
         assert new_rows[0].collected_at.replace(tzinfo=None) == datetime(2025, 8, 14, 10, 0)
 
     async def test_fetch_lms_passes_derived_employee_id(self, evidence_client, test_db, seed_db):
+        test_db.add(_deviation("DEV-LMS"))
         test_db.add(_lms_evidence("E-LMS-SEED", "DEV-LMS", {"employee_id": "EMP-2187"}))
         await test_db.commit()
 
@@ -624,7 +640,10 @@ class TestFetchFromSource:
         assert resp.status_code == 200
         assert mock_client.get.call_args.kwargs["params"] == {}
 
-    async def test_fetch_mes_with_case_id_param(self, evidence_client, evidence_env):
+    async def test_fetch_mes_with_case_id_param(self, evidence_client, test_db, evidence_env):
+        test_db.add(_deviation("DEV-MES-9"))
+        await test_db.commit()
+
         payload = {"items": [{"anomaly_type": "inner_glove_not_covered"}]}
         mock_client = _connector_http_client(payload)
         with patch("evidence_service.routes.httpx.AsyncClient", return_value=mock_client):
@@ -890,6 +909,7 @@ class TestSemanticSearchEndpoint:
     async def test_semantic_mode_with_embedding(self, test_db, evidence_env):
         ev = await test_db.get(Evidence, "E-LIST-02")
         ev.embedding = [1.0, 0.0]
+        ev.embedding_model = "embedding-3"  # 语义检索按 embedding_model 过滤
         await test_db.commit()
 
         llm = _mock_llm(embed=[1.0, 0.0])
@@ -968,6 +988,7 @@ class TestFindRelatedCasesEndpoint:
     async def test_related_cases_semantic_mode(self, test_db, evidence_env):
         ev = await test_db.get(Evidence, "E-LIST-03")
         ev.embedding = [1.0, 0.0]
+        ev.embedding_model = "embedding-3"  # 语义检索按 embedding_model 过滤
         await test_db.commit()
 
         llm = _mock_llm(embed=[1.0, 0.0])
@@ -1086,6 +1107,9 @@ async def direct_auth(test_db: AsyncSession, seed_db) -> AuthContext:
 
 class TestDirectCallFetchFromSource:
     async def test_fetch_bms_persist_and_dedup(self, test_db, seed_db, direct_auth):
+        test_db.add(_deviation("DEV-DIRECT"))
+        await test_db.commit()
+
         payload = {"items": [{"ahu_id": "AHU-7", "summary": "AHU-7 差压 470 Pa"}]}
         mock_client = _connector_http_client(payload)
         with patch("evidence_service.routes.httpx.AsyncClient", return_value=mock_client):
@@ -1130,6 +1154,7 @@ class TestDirectCallFetchFromSource:
         assert all(log.operator == LISA_EMAIL for log in logs)
 
     async def test_fetch_lms_derives_employee_id_param(self, test_db, seed_db, direct_auth):
+        test_db.add(_deviation("DEV-LMS-DIRECT"))
         test_db.add(_lms_evidence("E-LMS-DIRECT", "DEV-LMS-DIRECT", {"employee_id": "EMP-2187"}))
         await test_db.commit()
 

@@ -14,6 +14,28 @@ const api = axios.create({
   headers: { 'Content-Type': 'application/json' },
 });
 
+// 裸实例：不带任何拦截器 —— 供登出等需绕过 401 刷新/递归登出逻辑的一次性调用使用
+export const bareApi = axios.create({
+  baseURL: '/api/v1',
+  timeout: 10000,
+  headers: { 'Content-Type': 'application/json' },
+});
+
+/** 统一业务错误（审查 D 组：此前 reject 裸对象，无 stack、instanceof 不可判） */
+export class ApiError extends Error {
+  code: string;
+  status?: number;
+  details?: unknown;
+
+  constructor(message: string, code = 'ERROR', status?: number, details?: unknown) {
+    super(message);
+    this.name = 'ApiError';
+    this.code = code;
+    this.status = status;
+    this.details = details;
+  }
+}
+
 // 请求拦截器：注入 Authorization
 api.interceptors.request.use((config: InternalAxiosRequestConfig) => {
   const token = useAuthStore.getState().accessToken;
@@ -35,10 +57,11 @@ api.interceptors.response.use(
 
     if (status === 401 && !original._retry) {
       original._retry = true;
-      const { refreshToken, logout } = useAuthStore.getState();
+      // clear 只清状态不发请求：此处若调 logout（内含网络调用）会因无 token 的 401 无限递归
+      const { refreshToken, clear } = useAuthStore.getState();
 
       if (!refreshToken) {
-        logout();
+        clear();
       } else {
         try {
           // 第一个 401 发起刷新，其余等待同一个 Promise
@@ -55,17 +78,21 @@ api.interceptors.response.use(
             original.headers!.Authorization = `Bearer ${newTokens.access_token}`;
             return api(original);
           }
-          logout();
+          clear();
         } catch {
-          logout();
+          clear();
         }
       }
     }
 
-    // 统一错误格式
-    const data = error.response?.data as { code?: string; message?: string; details?: unknown } | undefined;
+    // 统一错误格式（后端错误体键为 detail；兼容 details）
+    const data = error.response?.data as
+      | { code?: string; message?: string; details?: unknown; detail?: unknown }
+      | undefined;
     const message = data?.message || error.message || '请求失败';
-    return Promise.reject({ code: data?.code || 'ERROR', message, details: data?.details, status });
+    return Promise.reject(
+      new ApiError(message, data?.code || 'ERROR', status, data?.details ?? data?.detail)
+    );
   }
 );
 

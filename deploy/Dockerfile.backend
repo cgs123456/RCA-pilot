@@ -1,28 +1,47 @@
 # RCA Pilot Backend Dockerfile — 通用镜像（所有微服务共用，非 root 运行）
-FROM python:3.11-slim
+# 多阶段构建：编译工具链只存在于 builder，运行时镜像不含 gcc/头文件
 
-# 设置工作目录
-WORKDIR /app
+# ---------- builder：编译安装 Python 依赖 ----------
+FROM python:3.11-slim AS builder
 
-# 设置环境变量
+WORKDIR /build
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# 安装系统依赖
+# asyncpg/psycopg2 等带 C 扩展的依赖需要编译工具链与 libpq 头文件
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# 复制依赖文件
-COPY backend/requirements.txt /app/requirements.txt
+COPY backend/requirements.txt /build/requirements.txt
+COPY backend/requirements.lock /build/requirements.lock
 
-# 安装 Python 依赖
-RUN pip install --no-cache-dir -r requirements.txt
+# 装到独立 prefix，最终阶段整体拷入。
+# 生产镜像用 requirements.lock --require-hashes 安装（传递依赖全量哈希锁定，
+# 供应链加固）；开发/测试工具见 requirements-dev.txt，不进镜像。
+RUN pip install --no-cache-dir --prefix=/install --require-hashes -r requirements.lock
 
-# 复制源码
+# ---------- runtime：精简运行时镜像 ----------
+FROM python:3.11-slim
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# 运行时只需 libpq5 共享库（头文件与编译器留在 builder）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /install /usr/local
+
 COPY backend /app/backend
 
 # 设置 Python 路径 — 包含 /app 和 /app/backend，使得 `from shared.xxx` 和 `from backend.shared.xxx` 均可工作

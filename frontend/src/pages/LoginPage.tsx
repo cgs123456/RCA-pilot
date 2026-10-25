@@ -21,6 +21,8 @@ export function LoginPage() {
   const { login } = useAuthStore();
   const [email, setEmail] = useState(import.meta.env.DEV ? 'lisa.chen@biopharma.com' : '');
   const [password, setPassword] = useState('');
+  const [mfaCode, setMfaCode] = useState('');
+  const [mfaRequired, setMfaRequired] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -29,10 +31,13 @@ export function LoginPage() {
     setError('');
     setLoading(true);
     try {
-      await login(email, password);
+      await login(email, password, mfaRequired ? mfaCode : undefined);
       navigate('/dashboard');
     } catch (err) {
-      setError((err as { message?: string })?.message || '登录失败');
+      const apiErr = err as { message?: string; code?: string };
+      // E4015：该账号已启用 TOTP 两步验证 —— 展开动态验证码输入后重试
+      if (apiErr?.code === 'E4015') setMfaRequired(true);
+      setError(apiErr?.message || '登录失败');
     } finally {
       setLoading(false);
     }
@@ -125,6 +130,29 @@ export function LoginPage() {
                 />
               </div>
             </div>
+
+            {mfaRequired && (
+              <div>
+                <label className="block text-xs font-medium text-ink-700 mb-1.5">
+                  动态验证码（认证器 6 位数字）
+                </label>
+                <div className="relative">
+                  <ShieldCheck className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-ink-400" />
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    maxLength={6}
+                    value={mfaCode}
+                    onChange={(e) => setMfaCode(e.target.value.replace(/\D/g, ''))}
+                    className="w-full h-10 pl-10 pr-3 rounded-md border border-ink-200 bg-white text-sm tracking-[0.3em] focus:outline-none focus:ring-2 focus:ring-brand-500 focus:border-transparent"
+                    placeholder="000000"
+                    autoComplete="one-time-code"
+                    autoFocus
+                    required
+                  />
+                </div>
+              </div>
+            )}
 
             <Button type="submit" size="lg" className="w-full" disabled={loading}>
               {loading ? '登录中...' : '登录'}

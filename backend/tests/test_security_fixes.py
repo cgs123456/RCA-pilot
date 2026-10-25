@@ -128,6 +128,30 @@ class TestSignatureOrder:
                 )
             assert "不同用户" in str(exc.value)
 
+    async def test_approve_by_non_assigned_reviewer_rejected(self, test_db: AsyncSession, seed_db):
+        """指定审核人一致性：案例指派 U-JW 时，其他持 sign:approve 者（含 admin）不得代批"""
+        from case_service.routes import sign_case
+        from shared.exceptions import ForbiddenError
+        from shared.models import SignatureRecord
+
+        test_db.add(self._make_case("DEV-SIG-004"))
+        admin = seed_db[2]  # admin 持有 sign:approve，但非本案例指定审核人
+        await test_db.commit()
+        test_db.add(SignatureRecord(
+            id="SIG-DEV-SIG-004-SUBMIT-U-LC", case_id="DEV-SIG-004",
+            signer_id="U-LC", signer_role="investigator",
+            signature_meaning="提交签名", signed_at=datetime.now(UTC),
+        ))
+        await test_db.commit()
+
+        with patch("case_service.routes.verify_password", return_value=True):
+            with pytest.raises(ForbiddenError) as exc:
+                await sign_case(
+                    request=MagicMock(), case_id="DEV-SIG-004", body=_sig_body("approve"),
+                    db=test_db, auth=_auth_ctx(admin, {"sign:approve"}),
+                )
+            assert "指定 QA 审核人" in str(exc.value)
+
     async def test_cross_user_veto_approvedirect_submit(self, test_db: AsyncSession, seed_db):
         """越权测试：QA 批准前必须存在投稿者的 submit 记录，否则拒绝"""
         from case_service.routes import sign_case
@@ -197,6 +221,116 @@ class TestSignatureOrder:
             progress=100,
             hitl_gates={f"gate{i}": "done" for i in range(1, 6)},
         )
+
+
+# ============================================================
+#  结案重审（reopen）—— 结案后修订必须走受控重开
+# ============================================================
+class TestReopenCase:
+    """POST /cases/{id}/reopen：仅 QA 批准人可重开 closed 案例，旧签名保留"""
+
+    @staticmethod
+    def _make_case(case_id, status="reviewing"):
+        from shared.models import Deviation
+
+        return Deviation(
+            id=case_id,
+            title="重审流程测试案例（reopen 回归测试）",
+            severity="major",
+            status=status,
+            discovered_at=datetime.now(UTC),
+            investigator_id="U-LC",
+            qa_reviewer_id="U-JW",
+            progress=100,
+            hitl_gates={f"gate{i}": "done" for i in range(1, 6)},
+        )
+
+    async def _reopen(self, test_db: AsyncSession, seed_db, case_id, permissions=None):
+        from case_service.routes import reopen_case
+        from shared.schemas import CaseReopenRequest
+
+        qa = seed_db[1]
+        body = CaseReopenRequest(reason="CAPA 验证发现新证据，需修订根因结论")
+        return await reopen_case(
+            request=MagicMock(), case_id=case_id, body=body,
+            db=test_db, auth=_auth_ctx(qa, permissions or {"sign:approve"}),
+        )
+
+    async def test_reopen_closed_case(self, test_db: AsyncSession, seed_db):
+        from shared.models import Deviation
+
+        test_db.add(self._make_case("DEV-REOPEN-001", status="closed"))
+        await test_db.commit()
+
+        case = await self._reopen(test_db, seed_db, "DEV-REOPEN-001")
+        assert case.status == "reviewing"
+        assert case.progress == 90
+        assert case.meta["reopen"]["reopened_by"] == "U-JW"
+        await test_db.commit()
+
+        row = (await test_db.execute(
+            select(Deviation).where(Deviation.id == "DEV-REOPEN-001")
+        )).scalar_one()
+        assert row.status == "reviewing"
+
+    async def test_reopen_requires_closed(self, test_db: AsyncSession, seed_db):
+        from case_service.routes import reopen_case
+        from shared.exceptions import ConflictError
+        from shared.schemas import CaseReopenRequest
+
+        test_db.add(self._make_case("DEV-REOPEN-002", status="reviewing"))
+        qa = seed_db[1]
+        await test_db.commit()
+
+        with pytest.raises(ConflictError):
+            await reopen_case(
+                request=MagicMock(), case_id="DEV-REOPEN-002",
+                body=CaseReopenRequest(reason="尚未结案不应允许重开"),
+                db=test_db, auth=_auth_ctx(qa, {"sign:approve"}),
+            )
+
+    async def test_reopen_requires_sign_approve(self, test_db: AsyncSession, seed_db):
+        from case_service.routes import reopen_case
+        from shared.exceptions import ForbiddenError
+        from shared.schemas import CaseReopenRequest
+
+        test_db.add(self._make_case("DEV-REOPEN-003", status="closed"))
+        investigator = seed_db[0]
+        await test_db.commit()
+
+        with pytest.raises(ForbiddenError):
+            await reopen_case(
+                request=MagicMock(), case_id="DEV-REOPEN-003",
+                body=CaseReopenRequest(reason="调查员无权单方面重开已结案案例"),
+                db=test_db, auth=_auth_ctx(investigator, {"sign:submit"}),
+            )
+
+    async def test_resubmit_after_reopen(self, test_db: AsyncSession, seed_db):
+        """重开后必须重新走 submit → approve（旧 submit 仍在也不能跳过 approve 校验）"""
+        from case_service.routes import reopen_case, sign_case
+        from shared.exceptions import ValidationError
+        from shared.models import Deviation
+        from shared.schemas import CaseReopenRequest
+
+        test_db.add(self._make_case("DEV-REOPEN-004", status="closed"))
+        investigator, qa = seed_db[0], seed_db[1]
+        await test_db.commit()
+
+        await reopen_case(
+            request=MagicMock(), case_id="DEV-REOPEN-004",
+            body=CaseReopenRequest(reason="监管检查反馈需要补充稳定性数据"),
+            db=test_db, auth=_auth_ctx(qa, {"sign:approve"}),
+        )
+        # 重开仅回 reviewing；approve 仍要求先有他人 submit —— 直接批准被拒
+        with patch("case_service.routes.verify_password", return_value=True):
+            with pytest.raises(ValidationError) as exc:
+                await sign_case(
+                    request=MagicMock(), case_id="DEV-REOPEN-004", body=_sig_body("approve"),
+                    db=test_db, auth=_auth_ctx(qa, {"sign:approve"}),
+                )
+            assert "submit" in str(exc.value)
+        _ = investigator
+        _ = Deviation
 
 
 # ============================================================
@@ -280,6 +414,92 @@ class TestPipelineDedup:
                 await start_pipeline(request=request, body=body, background_tasks=MagicMock(), db=test_db)
         finally:
             settings.service_api_key = old_key
+
+    async def test_user_call_without_triggered_by_uses_system_default(
+        self, test_db: AsyncSession, seed_db
+    ):
+        """前端 agentApi.run 只发 case_id（triggered_by 由服务端 JWT 归因决定）——
+        schema 必须放行缺省 triggered_by，否则浏览器端启动流水线一律 422。"""
+        from sqlalchemy import select
+
+        from agent_service.routes import start_pipeline
+        from shared.config import settings
+        from shared.models import AgentRun, Deviation
+        from shared.schemas import AgentRunCreate
+
+        case = Deviation(
+            id="DEV-RUN-002",
+            title="无 triggered_by 启动流水线回归测试案例",
+            severity="minor",
+            status="investigating",
+            discovered_at=datetime.now(UTC),
+            investigator_id="U-LC",
+            hitl_gates={},
+        )
+        test_db.add(case)
+        await test_db.commit()
+
+        old_key = settings.service_api_key
+        settings.service_api_key = "test-service-key"
+        try:
+            request = MagicMock()
+            request.headers = {"X-Service-Key": "test-service-key"}
+            request.client = SimpleNamespace(host="127.0.0.1")
+            # 模拟前端真实载荷：{"case_id": "..."}，无 triggered_by
+            body = AgentRunCreate(case_id="DEV-RUN-002")
+
+            bg = MagicMock()
+            run = await start_pipeline(request=request, body=body, background_tasks=bg, db=test_db)
+            assert bg.add_task.called
+            row = (
+                await test_db.execute(select(AgentRun).where(AgentRun.id == run.id))
+            ).scalar_one()
+            assert row.triggered_by == "system"
+        finally:
+            settings.service_api_key = old_key
+
+
+    async def test_user_channel_forces_jwt_attribution(self, test_db: AsyncSession, seed_db):
+        """消融实验 E2：用户通道（JWT）客户端伪造 triggered_by 必须被忽略 ——
+        审计归因强制取 JWT 邮箱（agent_service/routes.py:133）。"""
+        from sqlalchemy import select
+
+        from agent_service.routes import start_pipeline
+        from shared.models import AgentRun, Deviation, User
+        from shared.schemas import AgentRunCreate
+        from shared.security import create_access_token
+
+        case = Deviation(
+            id="DEV-RUN-003",
+            title="用户通道归因消融测试案例",
+            severity="minor",
+            status="investigating",
+            discovered_at=datetime.now(UTC),
+            investigator_id="U-LC",
+            hitl_gates={},
+        )
+        test_db.add(case)
+        await test_db.commit()
+
+        user = (await test_db.execute(select(User).where(User.id == "U-LC"))).scalar_one()
+        token = create_access_token(user.id, claims={"email": user.email, "role": user.role})
+
+        # 无 X-Service-Key → 用户通道；body 携带伪造归因
+        request = MagicMock()
+        request.headers = {}
+        request.client = SimpleNamespace(host="127.0.0.1")
+        body = AgentRunCreate(case_id="DEV-RUN-003", triggered_by="spoofed-admin@example.com")
+
+        run = await start_pipeline(
+            request=request,
+            body=body,
+            background_tasks=MagicMock(),
+            db=test_db,
+            authorization=f"Bearer {token}",
+        )
+        row = (await test_db.execute(select(AgentRun).where(AgentRun.id == run.id))).scalar_one()
+        assert row.triggered_by == user.email
+        assert row.triggered_by != "spoofed-admin@example.com"
 
 
 # ============================================================
@@ -371,3 +591,129 @@ class TestHitlEdit:
             body=FiveWhyUpdate(answer="二次修正"), db=test_db, auth=auth,
         )
         assert detail.five_whys[0].answer == "二次修正"
+
+
+# ============================================================
+#  B4/B5 数据级隔离（P2-③）
+# ============================================================
+class TestDataIsolation:
+    """qa_reviewer 只能处理指派给本人的案例；reviewing 状态核心字段冻结"""
+
+    @staticmethod
+    def _make_iso_case(case_id, status="investigating"):
+        from shared.models import Deviation
+
+        return Deviation(
+            id=case_id,
+            title="数据级隔离测试案例（B4/B5 回归）",
+            severity="minor",
+            status=status,
+            discovered_at=datetime.now(UTC),
+            investigator_id="U-LC",
+            qa_reviewer_id="U-JW",
+            progress=20,
+            hitl_gates={f"gate{i}": ("done" if i == 1 else "pending") for i in range(1, 6)},
+        )
+
+    async def test_qa_reviewer_restricted_to_assigned_case(self, test_db, seed_db):
+        from case_service.routes import handle_hitl_gate
+        from shared.exceptions import ForbiddenError
+        from shared.models import User
+        from shared.schemas import HitlGateRequest
+        from shared.security import hash_password
+
+        other_qa = User(
+            id="U-QA2",
+            email="u-qa2" + "@rca.local",
+            name="Second QA",
+            role="qa_reviewer",
+            dept="质量保证",
+            title="QA 审核员",
+            password_hash=hash_password("iso" + "-test-pw-1"),
+            is_active=True,
+        )
+        test_db.add(other_qa)
+        test_db.add(self._make_iso_case("DEV-ISO-001"))
+        await test_db.commit()
+
+        assigned, unassigned = seed_db[1], other_qa
+        # 被指派的 U-JW 正常处理 gate2
+        resp = await handle_hitl_gate(
+            request=MagicMock(), case_id="DEV-ISO-001", gate_id="gate2",
+            body=HitlGateRequest(gate_id="gate2", action="accept"),
+            db=test_db, auth=_auth_ctx(assigned, {"hitl:accept"}),
+        )
+        assert resp.action == "accept"
+        # 未被指派的 U-QA2 → 403
+        with pytest.raises(ForbiddenError, match="指派"):
+            await handle_hitl_gate(
+                request=MagicMock(), case_id="DEV-ISO-001", gate_id="gate3",
+                body=HitlGateRequest(gate_id="gate3", action="accept"),
+                db=test_db, auth=_auth_ctx(unassigned, {"hitl:accept"}),
+            )
+        # 管理员应急兜底不受限
+        resp2 = await handle_hitl_gate(
+            request=MagicMock(), case_id="DEV-ISO-001", gate_id="gate3",
+            body=HitlGateRequest(gate_id="gate3", action="accept"),
+            db=test_db, auth=_auth_ctx(seed_db[2], {"hitl:accept"}),
+        )
+        assert resp2.action == "accept"
+
+    async def test_unassigned_case_open_to_any_qa(self, test_db, seed_db):
+        """未指派审核人的案例任何 qa_reviewer 都可处理（现状兼容）"""
+        from case_service.routes import handle_hitl_gate
+        from shared.models import User
+        from shared.schemas import HitlGateRequest
+        from shared.security import hash_password
+
+        other_qa = User(
+            id="U-QA3",
+            email="u-qa3" + "@rca.local",
+            name="Third QA",
+            role="qa_reviewer",
+            dept="质量保证",
+            title="QA 审核员",
+            password_hash=hash_password("iso" + "-test-pw-2"),
+            is_active=True,
+        )
+        case = self._make_iso_case("DEV-ISO-002")
+        case.qa_reviewer_id = None
+        test_db.add(other_qa)
+        test_db.add(case)
+        await test_db.commit()
+
+        resp = await handle_hitl_gate(
+            request=MagicMock(), case_id="DEV-ISO-002", gate_id="gate2",
+            body=HitlGateRequest(gate_id="gate2", action="accept"),
+            db=test_db, auth=_auth_ctx(other_qa, {"hitl:accept"}),
+        )
+        assert resp.action == "accept"
+
+    async def test_reviewing_freezes_core_fields(self, test_db, seed_db):
+        from case_service.routes import update_case
+        from shared.exceptions import ValidationError
+        from shared.schemas import DeviationUpdate
+
+        test_db.add(self._make_iso_case("DEV-ISO-003", status="reviewing"))
+        investigator = seed_db[0]
+        await test_db.commit()
+
+        with pytest.raises(ValidationError, match="冻结"):
+            await update_case(
+                request=MagicMock(), case_id="DEV-ISO-003",
+                body=DeviationUpdate(title="审批阶段擅自改标题"),
+                db=test_db, auth=_auth_ctx(investigator, {"case:write"}),
+            )
+        with pytest.raises(ValidationError, match="冻结"):
+            await update_case(
+                request=MagicMock(), case_id="DEV-ISO-003",
+                body=DeviationUpdate(severity="critical"),
+                db=test_db, auth=_auth_ctx(investigator, {"case:write"}),
+            )
+        # 白名单字段（指派审核人/审批期限/备注）仍可更新
+        out = await update_case(
+            request=MagicMock(), case_id="DEV-ISO-003",
+            body=DeviationUpdate(qa_reviewer_id="U-JW", meta={"note": "审批备注"}),
+            db=test_db, auth=_auth_ctx(investigator, {"case:write"}),
+        )
+        assert out.qa_reviewer_id == "U-JW"

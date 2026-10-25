@@ -2,11 +2,11 @@
  * Card 组件
  */
 import { cn } from '@/lib/utils';
-import type { ReactNode } from 'react';
+import type { HTMLAttributes, ReactNode } from 'react';
 
-export function Card({ children, className }: { children: ReactNode; className?: string }) {
+export function Card({ children, className, ...rest }: HTMLAttributes<HTMLDivElement> & { children: ReactNode }) {
   return (
-    <div className={cn('bg-white rounded-lg border border-ink-200 shadow-sm', className)}>
+    <div className={cn('bg-white rounded-lg border border-ink-200 shadow-sm', className)} {...rest}>
       {children}
     </div>
   );

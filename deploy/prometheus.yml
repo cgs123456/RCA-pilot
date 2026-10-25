@@ -9,15 +9,10 @@ scrape_configs:
   - job_name: 'rca-pilot-backend'
     metrics_path: /metrics
     static_configs:
+      # P3-① 架构收敛后的三个后端单元
       - targets:
-          - 'auth-service:8001'
-          - 'case-service:8002'
-          - 'evidence-service:8003'
+          - 'core-service:8000'
           - 'agent-service:8004'
-          - 'audit-service:8005'
-          - 'lms-connector:8011'
-          - 'bms-connector:8012'
-          - 'ems-connector:8013'
-          - 'mes-connector:8014'
+          - 'connector-gateway:8010'
         labels:
           app: rca-pilot

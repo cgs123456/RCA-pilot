@@ -1,0 +1,19 @@
+# RCA Pilot Backend — 开发/测试依赖
+# 安装方式：pip install -r requirements-dev.txt（自动带上运行时依赖）
+# 生产镜像（deploy/Dockerfile.backend）只安装 requirements.txt，不含本文件。
+
+-r requirements.txt
+
+# ============================================================
+# 测试
+# ============================================================
+pytest==9.0.3
+pytest-asyncio==1.4.0
+pytest-cov==7.0.0
+pytest-httpx==0.36.2        # FastAPI TestClient HTTP 拦截
+
+# ============================================================
+# 质量工具（与 CI、pre-commit 保持同版本）
+# ============================================================
+ruff==0.7.4                 # Lint + Format
+mypy==1.13.0                # 类型检查

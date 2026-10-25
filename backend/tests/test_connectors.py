@@ -1,4 +1,4 @@
-﻿"""Connector 扩展测试（Phase 2 改进6）
+"""Connector 扩展测试（Phase 2 改进6）
 
 覆盖：
 - BMS Connector mock 数据完整性（AHU-7 差压时间序列、anomalies 过滤）
@@ -190,15 +190,16 @@ class TestConnectorConfig:
 
     def test_bms_connector_url_default(self):
         from shared.config import settings
-        assert settings.bms_connector_url == "http://bms-connector:8012"
+        # P3-① 收敛后四个 connector 共用 connector-gateway 单容器
+        assert settings.bms_connector_url == "http://connector-gateway:8010"
 
     def test_ems_connector_url_default(self):
         from shared.config import settings
-        assert settings.ems_connector_url == "http://ems-connector:8013"
+        assert settings.ems_connector_url == "http://connector-gateway:8010"
 
     def test_mes_connector_url_default(self):
         from shared.config import settings
-        assert settings.mes_connector_url == "http://mes-connector:8014"
+        assert settings.mes_connector_url == "http://connector-gateway:8010"
 
     def test_bms_connector_port_default(self):
         from shared.config import settings
@@ -212,6 +213,46 @@ class TestConnectorConfig:
         from shared.config import settings
         assert settings.mes_connector_port == 8014
 
+    def test_fetch_urls_match_connector_routes(self):
+        """防回归：fetch_from_source 拼接的路径必须与 connector 路由实际挂载路径一致。
+
+        历史缺陷：拼接时漏 /api/v1 前缀，mock httpx 的测试断言与实现同错未暴露，
+        真实部署 fetch_from_source 全部 404 —— 用真实路由表锁定契约。
+        """
+        from connectors.bms.routes import router as bms_router
+        from connectors.ems.routes import router as ems_router
+        from connectors.lms.routes import router as lms_router
+        from connectors.mes.routes import router as mes_router
+
+        expectations = {
+            "LMS": (lms_router, "/api/v1/lms/cert-status"),
+            "BMS": (bms_router, "/api/v1/bms/ahus"),
+            "EMS": (ems_router, "/api/v1/ems/exceedances"),
+            "MES": (mes_router, "/api/v1/mes/cctv/anomalies"),
+        }
+        for source, (conn_router, mounted_path) in expectations.items():
+            router_paths = {
+                route.path  # type: ignore[attr-defined]  # APIRoute 必有 path
+                for route in conn_router.routes
+                if hasattr(route, "path")
+            }
+            assert mounted_path.removeprefix("/api/v1") in router_paths, (
+                f"{source}: fetch 路径 {mounted_path} 与 {conn_router.prefix} 路由表不符"
+            )
+
+    def test_connector_gateway_mounts_all_sources(self):
+        """connector-gateway 应用必须挂载四个 connector 的完整路径（P3-① 收敛）"""
+        from connectors.gateway import app as gateway_app
+
+        paths = set(gateway_app.openapi()["paths"].keys())
+        for mounted in (
+            "/api/v1/lms/cert-status",
+            "/api/v1/bms/ahus",
+            "/api/v1/ems/exceedances",
+            "/api/v1/mes/cctv/anomalies",
+        ):
+            assert mounted in paths, f"connector-gateway 缺少路由 {mounted}"
+
 
 # ============================================================
 # fetch_from_source 路由集成测试（mock httpx）
@@ -221,8 +262,18 @@ class _FakeResult:
     """模拟 SQLAlchemy Result —— scalar_one 返回 0（无重复证据），first 返回 None（空链）"""
     def scalar_one(self):
         return 0
+    def scalar_one_or_none(self):
+        # case_id 存在性校验：默认视为存在
+        return "DEV-2025-08-147"
     def first(self):
         return None
+
+class _FakeNested:
+    """模拟 SAVEPOINT（begin_nested）—— 正常提交，不抛异常"""
+    async def __aenter__(self):
+        return self
+    async def __aexit__(self, *exc):
+        return False
 
 class _FakeDB:
     """最小 AsyncSession 假对象 —— 支持 fetch_from_source 的去重查询/flush"""
@@ -230,6 +281,8 @@ class _FakeDB:
         self.added = []
     async def execute(self, *a, **kw):
         return _FakeResult()
+    def begin_nested(self):
+        return _FakeNested()
     def add(self, obj):
         self.added.append(obj)
     async def flush(self):

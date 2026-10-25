@@ -2,13 +2,14 @@
  * 调查收件箱 — 偏差案例列表 + 筛选
  */
 import { useEffect, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
-import { Link } from 'react-router-dom';
-import { Search, Filter, Plus, Calendar, User, MapPin } from 'lucide-react';
-import { caseApi } from '@/services/case.service';
+import { useQuery, useMutation } from '@tanstack/react-query';
+import { Link, useNavigate } from 'react-router-dom';
+import { Search, Filter, Plus, Calendar, User, MapPin, Loader2, X } from 'lucide-react';
+import { caseApi, type CreateCaseBody } from '@/services/case.service';
 import { Card, CardBody } from '@/components/ui/Card';
 import { Badge } from '@/components/ui/Badge';
 import { Button } from '@/components/ui/Button';
+import { useToast } from '@/components/ui/Toast';
 import {
   formatDateTime, severityBadgeClass, severityLabel,
   statusBadgeClass, statusLabel,
@@ -45,6 +46,7 @@ export function InboxPage() {
   const [status, setStatus] = useState('');
   const [severity, setSeverity] = useState('');
   const [page, setPage] = useState(1);
+  const [createOpen, setCreateOpen] = useState(false);
 
   const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ['cases', { keyword: debouncedKeyword, status, severity, page }],
@@ -67,9 +69,10 @@ export function InboxPage() {
             共 {data?.total ?? 0} 个偏差案例
           </p>
         </div>
-        <Button>
+        <Button onClick={() => setCreateOpen(true)}>
           <Plus className="w-4 h-4" /> 新建偏差
         </Button>
+        {createOpen && <CreateCaseModal onClose={() => setCreateOpen(false)} />}
       </div>
 
       {/* 筛选栏 */}
@@ -262,6 +265,148 @@ export function InboxPage() {
           </Button>
         </div>
       )}
+    </div>
+  );
+}
+
+// ============================================================
+// 新建偏差 Modal（审查 D 组：按钮原为死 UI，无 onClick）
+// ============================================================
+function CreateCaseModal({ onClose }: { onClose: () => void }) {
+  const navigate = useNavigate();
+  const { toast } = useToast();
+  const [title, setTitle] = useState('');
+  const [description, setDescription] = useState('');
+  const [severity, setSeverity] = useState<NonNullable<CreateCaseBody['severity']>>('minor');
+  const [area, setArea] = useState('');
+
+  const createMutation = useMutation({
+    mutationFn: (body: CreateCaseBody) => caseApi.create(body),
+    onSuccess: (created) => {
+      toast('偏差案例已创建', 'success');
+      onClose();
+      navigate(`/investigation/${created.id}`);
+    },
+    onError: (e) => {
+      toast((e as { message?: string })?.message || '创建失败', 'error');
+    },
+  });
+
+  const canSubmit = title.trim().length > 0 && !createMutation.isPending;
+
+  const handleSubmit = (): void => {
+    if (!canSubmit) return;
+    createMutation.mutate({
+      title: title.trim(),
+      description: description.trim() || undefined,
+      severity,
+      area: area.trim() || undefined,
+      discovered_at: new Date().toISOString(),
+    });
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 animate-fade-in"
+      onClick={onClose}
+      onKeyDown={(e) => { if (e.key === 'Escape') onClose(); }}
+      role="dialog"
+      aria-modal="true"
+      aria-label="新建偏差案例"
+    >
+      <Card className="w-full max-w-md animate-scale-in" onClick={(e) => e.stopPropagation()}>
+        <CardBody>
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="text-sm font-semibold text-ink-800">新建偏差案例</h3>
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="关闭"
+              className="text-ink-400 hover:text-ink-600"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+          <form
+            className="space-y-3"
+            onSubmit={(e) => {
+              e.preventDefault();
+              handleSubmit();
+            }}
+          >
+            <div>
+              <label htmlFor="new-case-title" className="block text-xs font-medium text-ink-600 mb-1">
+                标题 <span className="text-danger-500">*</span>
+              </label>
+              <input
+                id="new-case-title"
+                type="text"
+                required
+                value={title}
+                onChange={(e) => setTitle(e.target.value)}
+                placeholder="例如：灌装线 A 偏差 — 环境监测超标"
+                className="w-full h-9 px-3 rounded-md border border-ink-200 bg-white text-sm focus:outline-none focus:ring-2 focus:ring-brand-500"
+              />
+            </div>
+            <div>
+              <label htmlFor="new-case-desc" className="block text-xs font-medium text-ink-600 mb-1">
+                描述
+              </label>
+              <textarea
+                id="new-case-desc"
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                rows={3}
+                placeholder="偏差发现经过与初步影响（可为空）"
+                className="w-full px-3 py-2 rounded-md border border-ink-200 bg-white text-sm focus:outline-none focus:ring-2 focus:ring-brand-500"
+              />
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label htmlFor="new-case-severity" className="block text-xs font-medium text-ink-600 mb-1">
+                  严重等级
+                </label>
+                <select
+                  id="new-case-severity"
+                  value={severity}
+                  onChange={(e) => setSeverity(e.target.value as NonNullable<CreateCaseBody['severity']>)}
+                  className="w-full h-9 px-2 rounded-md border border-ink-200 bg-white text-sm focus:outline-none focus:ring-2 focus:ring-brand-500"
+                >
+                  <option value="info">提示</option>
+                  <option value="minor">次要</option>
+                  <option value="major">重大</option>
+                  <option value="critical">严重</option>
+                </select>
+              </div>
+              <div>
+                <label htmlFor="new-case-area" className="block text-xs font-medium text-ink-600 mb-1">
+                  区域
+                </label>
+                <input
+                  id="new-case-area"
+                  type="text"
+                  value={area}
+                  onChange={(e) => setArea(e.target.value)}
+                  placeholder="例如：灌装车间 A 线"
+                  className="w-full h-9 px-3 rounded-md border border-ink-200 bg-white text-sm focus:outline-none focus:ring-2 focus:ring-brand-500"
+                />
+              </div>
+            </div>
+            <div className="flex gap-2 justify-end pt-1">
+              <Button type="button" variant="outline" size="sm" onClick={onClose} disabled={createMutation.isPending}>
+                取消
+              </Button>
+              <Button type="submit" size="sm" disabled={!canSubmit}>
+                {createMutation.isPending ? (
+                  <><Loader2 className="w-3.5 h-3.5 animate-spin" /> 创建中...</>
+                ) : (
+                  '创建'
+                )}
+              </Button>
+            </div>
+          </form>
+        </CardBody>
+      </Card>
     </div>
   );
 }

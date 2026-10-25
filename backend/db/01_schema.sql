@@ -10,7 +10,7 @@
 -- 扩展
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 CREATE EXTENSION IF NOT EXISTS "pg_trgm";  -- 全文搜索辅助
--- CREATE EXTENSION IF NOT EXISTS "vector";  -- pgvector, Phase 2 启用
+CREATE EXTENSION IF NOT EXISTS "vector";   -- pgvector：evidence.embedding_vec 检索列
 
 -- ============================================================
 --  用户表
@@ -27,6 +27,10 @@ CREATE TABLE IF NOT EXISTS users (
     shift           VARCHAR(20),
     cert            TEXT,
     password_hash   VARCHAR(200),  -- 内置登录（生产对接 OIDC）
+    -- P3-④ TOTP 第二因子：secret 非空且 pending=FALSE 时登录要求动态验证码
+    totp_secret     VARCHAR(64),
+    totp_pending    BOOLEAN NOT NULL DEFAULT FALSE,
+    totp_last_step  INTEGER NOT NULL DEFAULT 0,
     is_active       BOOLEAN NOT NULL DEFAULT TRUE,
     failed_login_attempts INTEGER NOT NULL DEFAULT 0,
     locked_until   TIMESTAMPTZ,
@@ -63,6 +67,10 @@ CREATE TABLE IF NOT EXISTS deviations (
     severity        VARCHAR(20) NOT NULL CHECK (severity IN ('critical','major','minor','info')),
     status          VARCHAR(30) NOT NULL CHECK (status IN ('pending','investigating','reviewing','closed')),
     case_type       VARCHAR(100),
+    -- P2-⑧ 偏差类型（OOS/OOT 联动基础）与批次影响
+    deviation_type  VARCHAR(32) NOT NULL DEFAULT 'process_deviation'
+                    CHECK (deviation_type IN ('process_deviation','lab_oos','lab_oot','complaint','equipment','environment','other')),
+    affected_batches JSONB NOT NULL DEFAULT '[]'::jsonb,
     complexity      INTEGER NOT NULL DEFAULT 1 CHECK (complexity BETWEEN 1 AND 3),
     location        VARCHAR(200),
     area            VARCHAR(200),
@@ -89,6 +97,22 @@ CREATE TABLE IF NOT EXISTS deviations (
 CREATE INDEX IF NOT EXISTS ix_deviations_status_severity ON deviations(status, severity);
 CREATE INDEX IF NOT EXISTS ix_deviations_investigator ON deviations(investigator_id);
 CREATE INDEX IF NOT EXISTS ix_deviations_discovered_at ON deviations(discovered_at DESC);
+CREATE INDEX IF NOT EXISTS ix_deviations_deviation_type ON deviations(deviation_type);
+
+-- ============================================================
+--  P2-⑧ 站内协作通知（指派/结案/CAPA/关卡就绪）
+-- ============================================================
+CREATE TABLE IF NOT EXISTS notifications (
+    id          VARCHAR(40) PRIMARY KEY,
+    user_id     VARCHAR(32) NOT NULL REFERENCES users(id),
+    case_id     VARCHAR(32) REFERENCES deviations(id),
+    type        VARCHAR(50) NOT NULL,
+    payload     JSONB NOT NULL DEFAULT '{}'::jsonb,
+    read_at     TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_notifications_user_created ON notifications(user_id, created_at);
+CREATE INDEX IF NOT EXISTS ix_notifications_unread ON notifications(user_id) WHERE read_at IS NULL;
 
 -- ============================================================
 --  证据
@@ -106,6 +130,8 @@ CREATE TABLE IF NOT EXISTS evidence (
     embedding       JSONB,
     embedding_model VARCHAR(80),
     embedded_at     TIMESTAMPTZ,
+    -- pgvector 检索副本（JSONB embedding 仍是 source of truth，0006 迁移同款回填）
+    embedding_vec   vector,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS ix_evidence_source_case ON evidence(source_system, case_id);
@@ -173,7 +199,7 @@ CREATE INDEX IF NOT EXISTS ix_skeptic_case ON skeptic_challenges(case_id);
 CREATE TABLE IF NOT EXISTS agent_runs (
     id              VARCHAR(50) PRIMARY KEY,
     case_id         VARCHAR(32) NOT NULL REFERENCES deviations(id) ON DELETE CASCADE,
-    status          VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','running','paused','completed','failed')),
+    status          VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','running','paused','cancelled','completed','failed')),
     current_agent   VARCHAR(30),
     started_at      TIMESTAMPTZ,
     completed_at    TIMESTAMPTZ,
@@ -184,6 +210,10 @@ CREATE TABLE IF NOT EXISTS agent_runs (
 );
 CREATE INDEX IF NOT EXISTS ix_agentruns_case ON agent_runs(case_id);
 CREATE INDEX IF NOT EXISTS ix_agentruns_status ON agent_runs(status);
+-- DB 级兜底：同案例只允许一条活跃流水线（与 agent_service.ACTIVE_RUN_STATUSES 对齐，
+-- 对应迁移 20261025_0005；paused/completed/failed/cancelled 历史行不受限）
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agentruns_one_active_per_case
+    ON agent_runs(case_id) WHERE status IN ('pending','running');
 
 -- ============================================================
 --  审计日志 — 不可篡改
@@ -247,10 +277,13 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS trg_users_updated ON users;
 CREATE TRIGGER trg_users_updated BEFORE UPDATE ON users
     FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+DROP TRIGGER IF EXISTS trg_deviations_updated ON deviations;
 CREATE TRIGGER trg_deviations_updated BEFORE UPDATE ON deviations
     FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+DROP TRIGGER IF EXISTS trg_fivewhys_updated ON five_whys;
 CREATE TRIGGER trg_fivewhys_updated BEFORE UPDATE ON five_whys
     FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
 
@@ -263,6 +296,8 @@ CREATE TABLE IF NOT EXISTS signatures (
     signer_id       VARCHAR(32) NOT NULL REFERENCES users(id),
     signer_role     VARCHAR(30) NOT NULL,
     signature_meaning VARCHAR(100) NOT NULL,
+    -- 0=首次签署；reopen 后重签为新修订轮次（重签唯一键四列含 revision）
+    revision         INTEGER NOT NULL DEFAULT 0,
     signed_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     certificate_fingerprint VARCHAR(80),
     ip_address      VARCHAR(50),
@@ -270,7 +305,7 @@ CREATE TABLE IF NOT EXISTS signatures (
 );
 CREATE INDEX IF NOT EXISTS ix_signatures_case ON signatures(case_id);
 CREATE INDEX IF NOT EXISTS ix_signatures_signer ON signatures(signer_id);
-CREATE UNIQUE INDEX IF NOT EXISTS ux_signatures_case_meaning_signer ON signatures(case_id, signature_meaning, signer_id);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_signatures_case_meaning_signer ON signatures(case_id, signature_meaning, signer_id, revision);
 
 -- 电子签名记录同样是 GxP 关键记录 —— 禁止 UPDATE/DELETE/TRUNCATE
 CREATE OR REPLACE FUNCTION signatures_immutable_guard() RETURNS trigger AS $$

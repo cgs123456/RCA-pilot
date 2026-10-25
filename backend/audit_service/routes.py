@@ -15,6 +15,7 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.audit import append_audit_log, verify_hash_chain
+from shared.audit_anchor import anchor_chain_head, read_anchors, verify_against_anchors
 from shared.auth_middleware import AuthContext, get_db_from_auth, require
 from shared.models import AuditLog
 from shared.rate_limit import api_limit, write_limit
@@ -230,6 +231,56 @@ async def export_logs(
         media_type="application/json",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@router.get("/anchor/records", summary="读取外部锚点记录（最近 N 条）")
+@api_limit
+async def list_anchor_records(
+    request: Request,
+    limit: int = Query(default=20, ge=1, le=500),
+    _: AuthContext = Depends(require("audit:read")),
+) -> dict:
+    """读取审计链头外部锚点记录（WORM 文件尾部，新→旧）"""
+    records = list(reversed(read_anchors(limit=limit)))
+    return {"records": records, "count": len(records)}
+
+
+@router.get("/anchor/verify", summary="比对库内链头与外部锚点（链尾删除/改写检测）")
+@api_limit
+async def verify_anchor_endpoint(
+    request: Request,
+    db: AsyncSession = Depends(get_db_from_auth),
+    _: AuthContext = Depends(require("audit:read")),
+) -> dict:
+    """B9 篡改检测：外部锚点的 seq/hash 高于或不同于库内链头即证明审计库被删改"""
+    return await verify_against_anchors(db)
+
+
+@router.post("/anchor", summary="立即锚定当前链头到外部只读存储", status_code=201)
+@write_limit
+async def anchor_now(
+    request: Request,
+    db: AsyncSession = Depends(get_db_from_auth),
+    auth: AuthContext = Depends(require("audit:export")),
+) -> dict:
+    """手动触发一次链头锚定（周期锚定由 audit-service 后台任务按配置间隔执行）。
+
+    锚点只增不改 —— 锚定动作本身也写入审计链（ANCHOR_CREATED），
+    锚点文件里因此出现自引用递进，删除锚点文件任意一行都会在下一次校验中暴露。
+    """
+    record = await anchor_chain_head(db)
+    if record is None:
+        return {"anchored": False, "note": "审计链为空，无锚点可写"}
+    await append_audit_log(
+        db,
+        operator=auth.email,
+        action="ANCHOR_CREATED",
+        target=f"audit-anchor/seq/{record['seq']}",
+        detail=f"链头 seq={record['seq']} 已锚定到外部只读存储",
+        ip_address=auth.ip_address,
+        session_id=auth.session_id,
+    )
+    return {"anchored": True, "record": record}
 
 
 # ============================================================

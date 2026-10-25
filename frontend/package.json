@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview --port 5173",
-    "lint": "eslint . --ext ts,tsx"
+    "lint": "eslint ."
   },
   "dependencies": {
     "@tanstack/react-query": "^5.59.0",

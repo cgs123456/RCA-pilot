@@ -38,6 +38,7 @@ import httpx
 from pydantic import BaseModel, ValidationError
 
 from .config import settings
+from .text_guard import mask_pii
 
 
 # ============================================================
@@ -61,6 +62,10 @@ class LLMResponseError(LLMError):
     def __init__(self, message: str, *, status_code: int | None = None):
         super().__init__(message)
         self.status_code = status_code
+
+
+class LLMTruncatedError(LLMResponseError):
+    """输出被 max_tokens 截断 —— 确定性失败，重试只会白烧 token，必须直接上抛"""
 
 
 def _is_client_error(e: Exception) -> bool:
@@ -135,6 +140,9 @@ class LLMClient:
         self._temperature: float = settings.llm_temperature
         self._timeout: float = float(settings.llm_timeout_seconds)
         self._max_retries: int = settings.llm_max_retries
+        self._json_reprompts: int = max(0, int(settings.llm_json_reprompts))
+        # 单客户端在途请求上限：流水线并发（fetch+embed+多 Agent）同时打上游时防配额击穿
+        self._semaphore = asyncio.Semaphore(max(1, int(settings.llm_max_concurrency)))
         # httpx 连接复用：按事件循环缓存 AsyncClient（pytest 每个用例新建 loop，
         # 模块级单例必须与 loop 绑定，否则跨 loop 复用会报 "Event loop is closed"）
         self._http_clients: weakref.WeakKeyDictionary[Any, httpx.AsyncClient] = weakref.WeakKeyDictionary()
@@ -145,7 +153,10 @@ class LLMClient:
         loop = asyncio.get_running_loop()
         client = self._http_clients.get(loop)
         if client is None or client.is_closed:
-            client = httpx.AsyncClient(timeout=self._timeout)
+            # 分级超时：连接建立 5s 封顶（握手挂死快速失败），读写沿用总超时
+            client = httpx.AsyncClient(
+                timeout=httpx.Timeout(self._timeout, connect=min(5.0, self._timeout))
+            )
             self._http_clients[loop] = client
         return client
 
@@ -202,6 +213,8 @@ class LLMClient:
         instance._temperature = temperature if temperature is not None else settings.llm_temperature
         instance._timeout = float(settings.llm_timeout_seconds)
         instance._max_retries = settings.llm_max_retries
+        instance._json_reprompts = max(0, int(settings.llm_json_reprompts))
+        instance._semaphore = asyncio.Semaphore(max(1, int(settings.llm_max_concurrency)))
         # 必须初始化连接池缓存：from_override 绕过 __init__，缺此字段会在
         # _get_http_client 首次访问 self._http_clients 时抛 AttributeError，
         # 导致多 Agent 博弈的 adversary 客户端必然降级为 primary_only。
@@ -290,8 +303,9 @@ class LLMClient:
         last_error: Exception | None = None
         for attempt in range(self._max_retries + 1):
             try:
-                client = await self._get_http_client()
-                resp = await client.post(url, headers=headers, json=payload)
+                async with self._semaphore:
+                    client = await self._get_http_client()
+                    resp = await client.post(url, headers=headers, json=payload)
 
                 if resp.status_code != 200:
                     raise LLMResponseError(
@@ -309,7 +323,7 @@ class LLMClient:
                 finish_reason = data.get("choices", [{}])[0].get("finish_reason")
                 self._record_usage(agent_label, data.get("usage"), finished=finish_reason != "length")
                 if finish_reason == "length":
-                    raise LLMResponseError(
+                    raise LLMTruncatedError(
                         f"LLM 输出被 max_tokens={payload['max_tokens']} 截断（finish_reason=length）"
                     )
 
@@ -319,6 +333,8 @@ class LLMClient:
                 last_error = LLMResponseError(f"网络异常: {type(e).__name__}: {e}")
             except (KeyError, json.JSONDecodeError) as e:
                 last_error = LLMResponseError(f"响应解析失败: {type(e).__name__}: {e}")
+            except LLMTruncatedError:
+                raise  # 截断是确定性失败，重试只会白烧 token
             except LLMResponseError as e:
                 # 4xx 客户端错误（除 429 外）不重试 —— 数值判断，不匹配文案
                 if _is_client_error(e):
@@ -359,8 +375,9 @@ class LLMClient:
         last_error: Exception | None = None
         for attempt in range(self._max_retries + 1):
             try:
-                client = await self._get_http_client()
-                resp = await client.post(url, headers=headers, json=payload)
+                async with self._semaphore:
+                    client = await self._get_http_client()
+                    resp = await client.post(url, headers=headers, json=payload)
 
                 if resp.status_code != 200:
                     raise LLMResponseError(
@@ -381,7 +398,7 @@ class LLMClient:
                     agent_label, data.get("usage"), finished=data.get("stop_reason") != "max_tokens"
                 )
                 if data.get("stop_reason") == "max_tokens":
-                    raise LLMResponseError(
+                    raise LLMTruncatedError(
                         f"LLM 输出被 max_tokens={payload['max_tokens']} 截断（stop_reason=max_tokens）"
                     )
                 return content
@@ -390,6 +407,8 @@ class LLMClient:
                 last_error = LLMResponseError(f"网络异常: {type(e).__name__}: {e}")
             except (KeyError, json.JSONDecodeError) as e:
                 last_error = LLMResponseError(f"响应解析失败: {type(e).__name__}: {e}")
+            except LLMTruncatedError:
+                raise  # 截断是确定性失败，重试只会白烧 token
             except LLMResponseError as e:
                 if _is_client_error(e):
                     raise
@@ -409,7 +428,7 @@ class LLMClient:
             "truncated": not finished,
         }
         try:
-            from .metrics import LLM_CALLS_TOTAL, LLM_TOKENS_TOTAL
+            from .metrics import LLM_CALLS_TOTAL, LLM_TOKENS_TOTAL, record_llm_cost
 
             u = self.last_usage
             if u["prompt_tokens"]:
@@ -419,6 +438,7 @@ class LLMClient:
                     u["completion_tokens"]
                 )
             LLM_CALLS_TOTAL.labels(agent=agent_label, model=self._model, outcome="success").inc()
+            record_llm_cost(agent_label, self._model, u["prompt_tokens"], u["completion_tokens"])
         except Exception:
             pass  # 指标失败不影响业务调用
 
@@ -447,27 +467,46 @@ class LLMClient:
             T: schema 实例
 
         Raises:
-            LLMError: 任何 LLM 调用或校验失败
+            LLMError: 任何 LLM 调用或校验失败（重问次数用尽后）
         """
-        content = await self.chat_completion(
-            system, user_prompt, json_mode=True, agent_label=agent_label, max_tokens=max_tokens
-        )
+        # 校验失败修复性重问：把校验错误回喂给模型再试（JSON 字段名/类型错误
+        # 这类问题一次修复重问的命中率远高于盲重试），用尽后仍失败才抛错
+        repair_note = ""
+        last_error: LLMError
+        for round_no in range(self._json_reprompts + 1):
+            content = await self.chat_completion(
+                system,
+                user_prompt + repair_note,
+                json_mode=True,
+                agent_label=agent_label,
+                max_tokens=max_tokens,
+            )
 
-        # 提取 JSON（容忍 LLM 在 JSON 前后加文字说明）
-        json_str = self._extract_json(content)
-        try:
-            data = json.loads(json_str)
-        except json.JSONDecodeError as e:
-            raise LLMResponseError(
-                f"JSON 解析失败: {e}；原始内容前 500 字符: {content[:500]!r}"
-            ) from e
+            # 提取 JSON（容忍 LLM 在 JSON 前后加文字说明）
+            json_str = self._extract_json(content)
+            try:
+                data = json.loads(json_str)
+            except json.JSONDecodeError as e:
+                last_error = LLMResponseError(
+                    f"JSON 解析失败: {e}；原始内容前 500 字符: {content[:500]!r}"
+                )
+            else:
+                try:
+                    return schema.model_validate(data)
+                except ValidationError as e:
+                    last_error = LLMResponseError(
+                        f"Schema 校验失败 ({schema.__name__}): {e}"
+                    )
 
-        try:
-            return schema.model_validate(data)
-        except ValidationError as e:
-            raise LLMResponseError(
-                f"Schema 校验失败 ({schema.__name__}): {e}"
-            ) from e
+            if round_no < self._json_reprompts:
+                repair_note = (
+                    "\n\n【修复请求】你上一次的输出未能通过校验，错误信息：\n"
+                    f"{last_error}\n"
+                    "请修正后重新输出完整、合法、符合要求的 JSON，"
+                    "不要输出任何解释文字或代码块围栏。"
+                )
+
+        raise last_error
 
     # ------------------------------------------------------------
     # 内部工具
@@ -595,8 +634,12 @@ class LLMClient:
         raise last_error or LLMResponseError("Embedding 调用失败：未知错误")
 
     async def embed_text(self, text: str) -> list[float]:
-        """单条文本向量化（embed_texts 的便捷封装）"""
-        results = await self.embed_texts([text])
+        """单条文本向量化（embed_texts 的便捷封装）
+
+        出站前先做 PII 掩码：embedding API 是外部处理器，证据摘要/检索词
+        可能携带患者、员工等个人信息，进入向量库前统一脱敏（ALCOA+ 最小化原则）。
+        """
+        results = await self.embed_texts([mask_pii(text)])
         return results[0]
 
 

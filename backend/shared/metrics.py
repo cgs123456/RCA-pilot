@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import os
 import time
 
 from fastapi import FastAPI, Request
@@ -21,6 +22,10 @@ from prometheus_client import (
 from sqlalchemy.pool import QueuePool
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
+
+# uvicorn 多 worker（H28）时单进程 registry 只能看到抓取命中的那一个 worker，
+# 必须启用 prometheus_client multiprocess 模式聚合全部进程（compose 已设该变量）。
+_MULTIPROC_DIR = os.getenv("PROMETHEUS_MULTIPROC_DIR")
 
 # ============================================================
 # 全局指标定义（所有服务共享）
@@ -53,17 +58,21 @@ REQUEST_ERRORS = Counter(
 )
 
 # 4. 饱和度（Saturation）—— DB 连接池使用率
+# multiprocess 模式下 gauge 需显式聚合语义：size 各 worker 相同取 max，
+# checked_out 是各 worker 各自持连数取 livesum，否则告警表达式会出现多对多匹配错误。
 DB_POOL_SIZE = Gauge(
     "db_pool_size",
     "DB 连接池大小",
     labelnames=("service",),
     registry=REGISTRY,
+    multiprocess_mode="max",
 )
 DB_POOL_CHECKED_OUT = Gauge(
     "db_pool_checked_out",
     "DB 连接池已检出连接数",
     labelnames=("service",),
     registry=REGISTRY,
+    multiprocess_mode="livesum",
 )
 
 # 5. 业务指标
@@ -72,6 +81,7 @@ CASES_TOTAL = Gauge(
     "偏差案例总数",
     labelnames=("status", "severity"),
     registry=REGISTRY,
+    multiprocess_mode="max",
 )
 # 注意：不用 case_id 作 label —— 无界高基数会拖垮 Prometheus（按 status 聚合即可）
 AGENT_RUNS_TOTAL = Counter(
@@ -84,6 +94,7 @@ AUDIT_LOGS_TOTAL = Gauge(
     "rca_audit_logs_total",
     "审计日志总条数",
     registry=REGISTRY,
+    multiprocess_mode="max",
 )
 
 # 6. 限流计数
@@ -107,6 +118,35 @@ LLM_CALLS_TOTAL = Counter(
     labelnames=("agent", "model", "outcome"),  # outcome: success | error
     registry=REGISTRY,
 )
+
+# LLM 成本估算价表（每百万 token，人民币）：(prompt, completion)。
+# 按各厂商 2026 年初公开牌价粗略记录，前缀匹配取第一个命中；仅用于相对监控与
+# 容量规划，不作为财务口径。未收录模型成本按 0 计（token 计数仍准确）。
+MODEL_COST_PER_MTOKEN: tuple[tuple[str, tuple[float, float]], ...] = (
+    ("glm-4-plus", (50.0, 50.0)),
+    ("glm-4", (0.1, 0.1)),  # glm-4-air/flash 等低价位档
+    ("qwen-plus", (0.8, 2.0)),
+    ("qwen-max", (2.4, 9.6)),
+    ("gpt-4o", (2.5, 10.0)),
+    ("claude-sonnet", (3.0, 15.0)),
+    ("embedding", (0.5, 0.0)),
+)
+LLM_COST_ESTIMATED_TOTAL = Counter(
+    "rca_llm_cost_estimated_cny_total",
+    "LLM 成本估算累计（人民币元，按单价表估算而非账单）",
+    labelnames=("agent", "model"),
+    registry=REGISTRY,
+)
+
+
+def record_llm_cost(agent: str, model: str, prompt_tokens: int, completion_tokens: int) -> None:
+    """按单价表估算并累计一次调用的成本（未收录模型跳过）"""
+    for prefix, (p_price, c_price) in MODEL_COST_PER_MTOKEN:
+        if model.startswith(prefix):
+            cost = (prompt_tokens * p_price + completion_tokens * c_price) / 1_000_000
+            if cost > 0:
+                LLM_COST_ESTIMATED_TOTAL.labels(agent=agent, model=model).inc(cost)
+            return
 AGENT_STAGE_DURATION = Histogram(
     "rca_agent_stage_duration_seconds",
     "Agent 单阶段耗时（秒）",
@@ -118,6 +158,17 @@ HITL_DECISIONS_TOTAL = Counter(
     "rca_hitl_decisions_total",
     "HITL 人工决策次数",
     labelnames=("gate", "action"),
+    registry=REGISTRY,
+)
+JTI_FAILOPEN_TOTAL = Counter(
+    "rca_jti_failopen_total",
+    "jti 黑名单降级放行次数（Redis 不可用/操作失败，吊销未真正生效）",
+    labelnames=("op",),  # op: revoke | check
+    registry=REGISTRY,
+)
+AUDIT_SEQ_CONFLICT_RETRIES_TOTAL = Counter(
+    "rca_audit_seq_conflict_retries_total",
+    "审计 seq 唯一冲突重试次数（advisory lock 兜底失效的竞态窗口）",
     registry=REGISTRY,
 )
 
@@ -185,6 +236,17 @@ class MetricsMiddleware(BaseHTTPMiddleware):
         return None
 
 
+def _render_metrics() -> bytes:
+    """单进程返回 REGISTRY；multiprocess 模式返回全部 worker 进程的聚合。"""
+    if _MULTIPROC_DIR:
+        from prometheus_client import multiprocess
+
+        registry = CollectorRegistry()
+        multiprocess.MultiProcessCollector(registry)
+        return generate_latest(registry)
+    return generate_latest(REGISTRY)
+
+
 def register_metrics_endpoint(app: FastAPI, service_name: str = "") -> None:
     """注册 /metrics 端点 —— Prometheus 抓取
 
@@ -206,6 +268,6 @@ def register_metrics_endpoint(app: FastAPI, service_name: str = "") -> None:
             pass
 
         return Response(
-            content=generate_latest(REGISTRY),
+            content=_render_metrics(),
             media_type=CONTENT_TYPE_LATEST,
         )

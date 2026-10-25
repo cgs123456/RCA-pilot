@@ -1,7 +1,7 @@
 /**
  * 审计追踪页 — hash 链日志 + 完整性验证 + 导出
  */
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useSearchParams } from 'react-router-dom';
 import {
@@ -17,15 +17,25 @@ import { formatDateTime, timeAgo, shortHash } from '@/lib/utils';
 export function AuditPage() {
   const [params] = useSearchParams();
   const [keyword, setKeyword] = useState(params.get('case_id') || '');
+  // 输入防抖 + 过滤条件变化时回到第 1 页（审查 D 组：每击键一次请求、翻页后改过滤停在旧页）
+  const [debouncedKeyword, setDebouncedKeyword] = useState(keyword);
   const [page, setPage] = useState(1);
   const [exporting, setExporting] = useState(false);
   const { toast } = useToast();
   const PAGE_SIZE = 50;
 
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedKeyword(keyword);
+      setPage(1);
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [keyword]);
+
   const { data: logs, isLoading, isError, refetch } = useQuery({
-    queryKey: ['audit-logs', keyword, page],
+    queryKey: ['audit-logs', debouncedKeyword, page],
     queryFn: () => auditApi.list({
-      case_id: keyword || undefined,
+      case_id: debouncedKeyword || undefined,
       page,
       page_size: PAGE_SIZE,
     }),

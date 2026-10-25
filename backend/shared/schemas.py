@@ -50,6 +50,22 @@ class RefreshRequest(BaseModel):
     refresh_token: str
 
 
+class TotpCodeRequest(BaseModel):
+    """TOTP 激活/停用请求"""
+    code: str = Field(min_length=6, max_length=6)
+
+
+class TotpDisableRequest(BaseModel):
+    """停用 TOTP 需验证登录密码（防会话劫持后静默关闭第二因子）"""
+    password: str = Field(min_length=12, max_length=128)
+
+
+class TotpSetupResponse(BaseModel):
+    """TOTP 注册响应 — 前端用 otpauth_uri 渲染二维码"""
+    secret: str
+    otpauth_uri: str
+
+
 class UserOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
@@ -70,12 +86,18 @@ class UserOut(BaseModel):
 Severity = Literal["critical", "major", "minor", "info"]
 CaseStatus = Literal["pending", "investigating", "reviewing", "closed"]
 HitlGateStatus = Literal["pending", "done", "rejected"]
+# P2-⑧ 偏差类型（OOS=检验结果超标 / OOT=趋势外）
+DeviationType = Literal[
+    "process_deviation", "lab_oos", "lab_oot", "complaint", "equipment", "environment", "other"
+]
 
 
 class DeviationBase(BaseModel):
     title: str = Field(min_length=5, max_length=500)
     description: str | None = None
     severity: Severity = "minor"
+    deviation_type: DeviationType = "process_deviation"
+    affected_batches: list[str] = Field(default_factory=list, max_length=50)
     case_type: str | None = None
     complexity: int = Field(default=1, ge=1, le=3)
     location: str | None = None
@@ -94,12 +116,36 @@ class DeviationBase(BaseModel):
 
 class DeviationCreate(DeviationBase):
     id: str | None = None  # 可由后端自动生成
+    # ICH Q9 FMEA 初评 —— 三分量各 1-10，RPN=三者乘积（1-1000）
+    fmea: FmeaScores | None = None
+    risk_owner: str | None = None
+
+
+class FmeaScores(BaseModel):
+    severity_score: int = Field(ge=1, le=10, description="严重度 S")
+    occurrence: int = Field(ge=1, le=10, description="频度 O")
+    detection: int = Field(ge=1, le=10, description="探测度 D")
+
+
+class RiskAssessmentUpdate(BaseModel):
+    fmea: FmeaScores
+    risk_owner: str | None = None
+
+
+class RiskAssessmentOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    risk_rpn: int
+    risk_category: str
+    risk_owner: str | None = None
+    fmea: FmeaScores | None = None
 
 
 class DeviationUpdate(BaseModel):
     title: str | None = None
     description: str | None = None
     severity: Severity | None = None
+    deviation_type: DeviationType | None = None
+    affected_batches: list[str] | None = Field(default=None, max_length=50)
     status: CaseStatus | None = None
     investigator_id: str | None = None
     qa_reviewer_id: str | None = None
@@ -116,6 +162,8 @@ class DeviationOut(BaseModel):
     description: str | None = None
     severity: Severity
     status: CaseStatus
+    deviation_type: DeviationType = "process_deviation"
+    affected_batches: list[str] = Field(default_factory=list)
     case_type: str | None = None
     complexity: int = 1
     location: str | None = None
@@ -131,6 +179,9 @@ class DeviationOut(BaseModel):
     immediate_action: str | None = None
     progress: int = 0
     closed_at: datetime | None = None
+    risk_rpn: int | None = None
+    risk_category: str | None = None
+    risk_owner: str | None = None
     hitl_gates: dict[str, str] = Field(default_factory=dict)
     meta: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
@@ -288,7 +339,9 @@ class AuditLogCreate(BaseModel):
 # ============================================================
 class AgentRunCreate(BaseModel):
     case_id: str
-    triggered_by: str
+    # 用户调用时服务端强制取 JWT 归因（审计归因不可伪造），客户端可不传；
+    # 服务间调用（X-Service-Key）显式声明，缺省落 "system"。
+    triggered_by: str | None = None
 
 
 class AgentRunOut(BaseModel):
@@ -326,6 +379,13 @@ class SignatureOut(BaseModel):
     certificate_fingerprint: str | None = None
     ip_address: str | None = None
     confirmation_text: str
+    # 受控修订轮次（reopen 计数），0=首次签署
+    revision: int = 0
+
+
+class CaseReopenRequest(BaseModel):
+    """结案重审申请（P2：结案后修订必须走重开 → 重新签署的受控流程）"""
+    reason: str = Field(min_length=10, max_length=2000, description="重审原因，须说明修订依据")
 
 
 # ============================================================
@@ -383,6 +443,86 @@ class SourceSystemOut(BaseModel):
     health_status: str
     last_sync_at: datetime | None = None
     is_readonly: bool = True
+
+
+# ============================================================
+#  CAPA（纠正预防措施）
+# ============================================================
+class CapaCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=500)
+    description: str | None = Field(default=None, max_length=8000)
+    severity: Literal["critical", "major", "minor", "info"] = "minor"
+    responsibility: str = Field(min_length=1, max_length=100)
+    due_date: datetime | None = None
+
+
+class CapaUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=500)
+    description: str | None = Field(default=None, max_length=8000)
+    status: Literal["pending", "under_review", "implemented", "verified", "closed"] | None = None
+    responsibility: str | None = Field(default=None, min_length=1, max_length=100)
+    due_date: datetime | None = None
+    effectiveness_rate: int | None = Field(default=None, ge=0, le=100)
+
+
+class CapaOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    case_id: str
+    title: str
+    description: str | None
+    severity: str
+    status: str
+    responsibility: str
+    due_date: datetime | None
+    verified_by: str | None
+    verified_at: datetime | None
+    effectiveness_rate: int | None
+    created_at: datetime
+    updated_at: datetime
+
+
+# ============================================================
+#  报告版本（ICH Q9，版本化管理）
+# ============================================================
+class ReportCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=500)
+    content: str = Field(min_length=1, max_length=200_000)
+    change_reason: str | None = Field(default=None, max_length=2000)
+
+
+class ReportOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    case_id: str
+    version: int
+    title: str
+    content: str
+    status: str
+    author_id: str
+    approved_by: str | None
+    approved_at: datetime | None
+    change_reason: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+# ============================================================
+#  P2-⑧ 站内协作通知
+# ============================================================
+class NotificationOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    type: str
+    case_id: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    read_at: datetime | None = None
+    created_at: datetime
+
+
+class NotificationListOut(BaseModel):
+    items: list[NotificationOut]
+    unread: int
 
 
 # Forward refs

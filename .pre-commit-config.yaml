@@ -39,26 +39,26 @@ repos:
 
   # ----------------------------------------------------------
   # ESLint：前端 JavaScript/TypeScript 代码检查
-  # 额外依赖 eslint-config-react-hooks 用于 React Hooks 规则校验
+  # 用前端自己的 devDependencies（eslint + typescript-eslint + react-hooks
+  # 插件，与 CI 完全同版本）—— mirrors-eslint 镜像只装 eslint 本体，缺
+  # flat config 依赖必然崩溃，且无法感知 frontend/eslint.config.js。
+  # 前置条件：cd frontend && npm ci
   # ----------------------------------------------------------
-  - repo: https://github.com/pre-commit/mirrors-eslint
-    rev: v9.0.0
+  - repo: local
     hooks:
-      - id: eslint
+      - id: eslint-frontend
+        name: eslint (frontend via npm run lint)
+        entry: npm --prefix frontend run lint
+        language: system
         files: ^frontend/src/.*\.(ts|tsx|js|jsx)$
-        types: [file]
-        additional_dependencies:
-          - eslint-config-react-hooks
+        pass_filenames: false
 
   # ----------------------------------------------------------
-  # Prettier：前端代码格式化（TS/TSX/CSS）
+  # Prettier：已移除 —— 前端 package.json 无 prettier 依赖，且
+  # mirrors-prettier 仓库已归档（无 v4.0.0 可用 rev），该 hook 会让
+  # pre-commit install 直接失败。如需格式化请先在 frontend 引入 prettier
+  # 并改用 local hook（npm --prefix frontend run format）。
   # ----------------------------------------------------------
-  - repo: https://github.com/pre-commit/mirrors-prettier
-    rev: v4.0.0
-    hooks:
-      - id: prettier
-        files: ^frontend/src/.*\.(ts|tsx|css)$
-        types: [file]
 
   # ----------------------------------------------------------
   # 通用代码质量 hooks：白空格、文件结尾、YAML/大文件/合并冲突/私钥检测

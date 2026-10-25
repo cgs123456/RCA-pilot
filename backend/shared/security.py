@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, cast
@@ -12,6 +13,9 @@ import jwt
 
 from .config import settings
 from .exceptions import AuthError, ForbiddenError
+from .metrics import JTI_FAILOPEN_TOTAL
+
+logger = logging.getLogger(__name__)
 
 # ---- 密码哈希 ----
 # 直接使用 bcrypt（绕过 passlib 1.7.4 与 bcrypt 4.x 的兼容问题）
@@ -137,6 +141,9 @@ def decode_token(token: str, expected_type: Literal["access", "refresh"] = "acce
 Role = Literal["admin", "investigator", "qa_reviewer", "ops_manager", "auditor", "operator"]
 
 # 权限矩阵：role → 允许的 action 列表
+# SoD 说明（21 CFR Part 11 双人签名）：admin 同时持有 sign:submit + sign:approve
+# 是小团队的应急兜底设计 —— 双签独立性不在权限矩阵强制，而在 sign_case 端点级强制：
+# ① submit → approve 顺序；② 同人双签拒绝；③ 指定 qa_reviewer_id 一致性校验。
 ROLE_PERMISSIONS: dict[str, set[str]] = {
     "admin": {
         "case:read", "case:write", "case:delete",
@@ -208,7 +215,8 @@ def sha256_hex(data: str | bytes) -> str:
 
 # ---- Token 吊销（jti 黑名单）----
 # 依赖 Redis；Redis 不可用时降级为"不吊销"（与旧行为一致），避免服务不可用。
-# 21 CFR Part 11 要求会话可即时终止，生产环境必须配置 Redis。
+# 21 CFR Part 11 要求会话可即时终止，生产环境必须配置 Redis；
+# 每次降级放行都计入 rca_jti_failopen_total 供告警（见 deploy/prometheus-alerts.yml）。
 
 async def revoke_jti(jti: str, ttl_seconds: int) -> bool:
     """将 jti 加入黑名单直至其自然过期。返回是否真正写入（False = 降级未生效）"""
@@ -218,11 +226,15 @@ async def revoke_jti(jti: str, ttl_seconds: int) -> bool:
 
     redis = await get_redis()
     if redis is None:
+        JTI_FAILOPEN_TOTAL.labels(op="revoke").inc()
+        logger.warning("jti 吊销降级：Redis 不可用，会话 %s 的吊销未生效", jti)
         return False
     try:
         await redis.setex(f"rca:jti_revoked:{jti}", ttl_seconds, "1")  # type: ignore[attr-defined]
         return True
     except Exception:
+        JTI_FAILOPEN_TOTAL.labels(op="revoke").inc()
+        logger.warning("jti 吊销降级：Redis 写入失败，会话 %s 的吊销未生效", jti)
         return False
 
 
@@ -234,8 +246,10 @@ async def is_jti_revoked(jti: str) -> bool:
 
     redis = await get_redis()
     if redis is None:
+        JTI_FAILOPEN_TOTAL.labels(op="check").inc()
         return False
     try:
         return bool(await redis.exists(f"rca:jti_revoked:{jti}"))  # type: ignore[attr-defined]
     except Exception:
+        JTI_FAILOPEN_TOTAL.labels(op="check").inc()
         return False

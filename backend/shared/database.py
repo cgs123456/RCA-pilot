@@ -60,6 +60,17 @@ async def db_session() -> AsyncGenerator[AsyncSession, None]:
             raise
 
 
+async def release_db_connection(db: AsyncSession) -> None:
+    """提交并结束当前事务，把连接归还连接池 —— 供长耗时 await（LLM/外部 HTTP）前调用。
+
+    expire_on_commit=False：已加载的 ORM 属性提交后仍可直接读取，不触发 IO；
+    之后的 db.execute 会自动开启新事务。调用点必须已完成该轮 prompt 所需的全部
+    数据库读取（未加载的 relationship 在提交后懒加载会在 async 下报 MissingGreenlet）。
+    """
+    if db.in_transaction():
+        await db.commit()
+
+
 # 连接池统计快照（供 Prometheus 采集）
 def pool_snapshot() -> dict[str, int | float | None]:
     """获取连接池当前使用情况快照"""

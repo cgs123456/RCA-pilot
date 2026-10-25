@@ -1,7 +1,9 @@
 # ============================================================
 # RCA Pilot — 持续部署流水线（CD）
 # 触发：CI 全部通过后（workflow_run 门禁，CI 红着不能部署）
-# 流程：构建并推送镜像（一次性构建、按服务名打多 tag）→ SBOM → SSH 部署 staging
+# 流程：构建并推送镜像（一次性构建、按服务名打多 tag）→ cosign 签名 → SBOM
+#       → cosign 验签 → SSH 部署 staging → 失败自动回滚上一版本
+# 手动触发（workflow_dispatch）= 回滚工具：输入 tag 回滚，留空回滚到 .previous_tag
 # ============================================================
 name: CD
 
@@ -10,7 +12,12 @@ on:
     workflows: [CI]
     types: [completed]
     branches: [main]
-  workflow_dispatch: {} # 支持手动触发
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "回滚目标镜像 tag（留空则自动使用服务器记录的上一版本 .previous_tag）"
+        required: false
+        type: string
 
 # 同一分支的旧部署自动取消，避免重复部署
 concurrency:
@@ -22,37 +29,51 @@ permissions:
   contents: read
   packages: write # 推送镜像到 ghcr.io 所需
 
-# 全部服务共用同一个后端镜像（同一 Dockerfile），按 compose 期望的服务名打 tag
+# 全部后端单元共用同一个后端镜像（同一 Dockerfile），按 compose 期望的服务名打 tag
+# P3-① 架构收敛后为三个后端单元：core-service / agent-service / connector-gateway
 env:
-  BACKEND_SERVICES: "auth-service case-service evidence-service agent-service audit-service lms-connector bms-connector ems-connector mes-connector"
+  BACKEND_SERVICES: "core-service agent-service connector-gateway"
+  # workflow_run 触发时 GITHUB_SHA 是默认分支 HEAD 而非 CI 验证过的提交；
+  # 一律以 CI 实际验证的 head_sha 为准（手动触发回退到 github.sha），防止部署未经 CI 验证的代码
+  DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
 
 jobs:
   # ============================================================
-  # Job 1: 构建并推送镜像 + SBOM
+  # Job 1: 构建并推送镜像 + SBOM + cosign 签名
   # ============================================================
   build-and-push-images:
     name: Build & Push Images
     runs-on: ubuntu-22.04
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event.workflow_run.conclusion == 'success' }} # 手动触发只做回滚，不重新构建部署
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # cosign keyless 签名（OIDC）
+
+    outputs:
+      backend_digest: ${{ steps.backend-push.outputs.digest }}
+      frontend_digest: ${{ steps.frontend-push.outputs.digest }}
 
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ env.DEPLOY_SHA }}
 
       - name: 提取镜像元数据
         id: meta
         run: |
-          echo "sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+          echo "sha=${DEPLOY_SHA::7}" >> $GITHUB_OUTPUT
           echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
 
       - name: 登录 GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 生成后端镜像 tag 列表（9 个服务名 + latest + sha）
+      - name: 生成后端镜像 tag 列表（3 个单元名 + latest + sha）
         id: backend-tags
         run: |
           TAGS=""
@@ -68,7 +89,8 @@ jobs:
           } >> $GITHUB_OUTPUT
 
       - name: 构建并推送后端镜像（一次构建，多服务名 tag）
-        uses: docker/build-push-action@v5
+        id: backend-push
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
         with:
           context: .
           file: deploy/Dockerfile.backend
@@ -78,7 +100,8 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: 构建并推送前端镜像
-        uses: docker/build-push-action@v5
+        id: frontend-push
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
         with:
           context: .
           file: deploy/Dockerfile.frontend
@@ -89,12 +112,22 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # GxP 供应链：keyless 签名 —— 按 digest 签一次，指向该 digest 的全部 tag 同时生效
+      - name: 安装 cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3.10.1
+
+      - name: cosign 签名后端镜像
+        run: cosign sign --yes "ghcr.io/${{ steps.meta.outputs.owner }}/core-service@${{ steps.backend-push.outputs.digest }}"
+
+      - name: cosign 签名前端镜像
+        run: cosign sign --yes "ghcr.io/${{ steps.meta.outputs.owner }}/frontend@${{ steps.frontend-push.outputs.digest }}"
+
       # GxP 供应链：生成 SBOM，证明运行镜像与验证记录一致
       - name: 生成 SBOM（Syft）
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           format: spdx-json
-          image: ghcr.io/${{ steps.meta.outputs.owner }}/auth-service:${{ steps.meta.outputs.sha }}
+          image: ghcr.io/${{ steps.meta.outputs.owner }}/core-service:${{ steps.meta.outputs.sha }}
           artifact-name: rca-pilot-sbom.spdx.json
 
   # ============================================================
@@ -113,18 +146,37 @@ jobs:
       - name: 提取镜像元数据
         id: meta
         run: |
-          echo "sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+          echo "sha=${DEPLOY_SHA::7}" >> $GITHUB_OUTPUT
           echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
+      - name: 登录 GHCR（cosign 验签需读取签名对象）
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 安装 cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3.10.1
+
+      # GxP 供应链：只部署本流水线构建并签名过的镜像
+      - name: cosign 验签（未签名或非本流水线签发的镜像禁止部署）
+        run: |
+          IDENTITY="^https://github.com/${{ github.repository }}/\.github/workflows/cd\.yml@"
+          ISSUER="https://token.actions.githubusercontent.com"
+          cosign verify --certificate-identity-regexp "$IDENTITY" --certificate-oidc-issuer "$ISSUER" \
+            "ghcr.io/${{ steps.meta.outputs.owner }}/core-service@${{ needs.build-and-push-images.outputs.backend_digest }}"
+          cosign verify --certificate-identity-regexp "$IDENTITY" --certificate-oidc-issuer "$ISSUER" \
+            "ghcr.io/${{ steps.meta.outputs.owner }}/frontend@${{ needs.build-and-push-images.outputs.frontend_digest }}"
 
       - name: SSH 部署到 staging 服务器
         id: deploy
-        uses: appleboy/ssh-action@v1.0.3
+        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
         with:
           host: ${{ secrets.STAGING_SSH_HOST }}
           username: ${{ secrets.STAGING_SSH_USER }}
           key: ${{ secrets.STAGING_SSH_PRIVATE_KEY }}
           port: ${{ secrets.STAGING_SSH_PORT || 22 }}
-          envs: GITHUB_SHA
           script: |
             set -e
             # 进入部署目录（docker-compose.yml 所在路径）
@@ -133,6 +185,11 @@ jobs:
             # 指向本次构建的镜像（compose pull 依赖 image: 字段 + RCA_REGISTRY/RCA_IMAGE_TAG）
             export RCA_REGISTRY="ghcr.io/${{ steps.meta.outputs.owner }}"
             export RCA_IMAGE_TAG="${{ steps.meta.outputs.sha }}"
+
+            # 记录当前已部署版本，供失败自动回滚与手动回滚使用
+            if [ -f .deployed_tag ] && [ "$(cat .deployed_tag)" != "$RCA_IMAGE_TAG" ]; then
+              cp .deployed_tag .previous_tag
+            fi
 
             # 拉取最新镜像（compose 中每个服务都有 image: 字段，pull 不再落空）
             docker compose pull
@@ -146,6 +203,7 @@ jobs:
               if [ "$UNHEALTHY" = "0" ]; then
                 echo "所有服务健康检查通过"
                 docker compose ps
+                echo "$RCA_IMAGE_TAG" > .deployed_tag
                 exit 0
               fi
               sleep 5
@@ -155,7 +213,83 @@ jobs:
             docker compose logs --tail 50
             exit 1
 
+      - name: 部署失败自动回滚到上一版本
+        if: failure()
+        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
+        with:
+          host: ${{ secrets.STAGING_SSH_HOST }}
+          username: ${{ secrets.STAGING_SSH_USER }}
+          key: ${{ secrets.STAGING_SSH_PRIVATE_KEY }}
+          port: ${{ secrets.STAGING_SSH_PORT || 22 }}
+          script: |
+            set -e
+            cd ${{ secrets.STAGING_DEPLOY_PATH }}
+            if [ ! -f .previous_tag ]; then
+              echo "无 .previous_tag 记录（首次部署失败），跳过自动回滚"
+              exit 0
+            fi
+            export RCA_REGISTRY="ghcr.io/${{ steps.meta.outputs.owner }}"
+            export RCA_IMAGE_TAG="$(cat .previous_tag)"
+            echo "自动回滚到 $RCA_IMAGE_TAG ..."
+            docker compose pull
+            docker compose up -d
+            echo "$RCA_IMAGE_TAG" > .deployed_tag
+
       - name: 输出部署 URL
         id: set-url
         run: |
           echo "staging-url=https://${{ secrets.STAGING_HOSTNAME || 'staging.rca-pilot.internal' }}" >> $GITHUB_OUTPUT
+
+  # ============================================================
+  # Job 3: 手动回滚（workflow_dispatch 触发）
+  # 输入 image_tag 则回滚到指定版本；留空则回滚到服务器记录的 .previous_tag
+  # ============================================================
+  rollback-staging:
+    name: Manual Rollback Staging
+    runs-on: ubuntu-22.04
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+
+    steps:
+      - name: 提取镜像元数据
+        id: meta
+        run: |
+          echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
+      - name: SSH 回滚 staging
+        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
+        with:
+          host: ${{ secrets.STAGING_SSH_HOST }}
+          username: ${{ secrets.STAGING_SSH_USER }}
+          key: ${{ secrets.STAGING_SSH_PRIVATE_KEY }}
+          port: ${{ secrets.STAGING_SSH_PORT || 22 }}
+          script: |
+            set -e
+            cd ${{ secrets.STAGING_DEPLOY_PATH }}
+            TARGET="${{ inputs.image_tag }}"
+            if [ -z "$TARGET" ]; then
+              if [ ! -f .previous_tag ]; then
+                echo "既未指定 image_tag，也无 .previous_tag 记录，无法回滚"
+                exit 1
+              fi
+              TARGET="$(cat .previous_tag)"
+            fi
+            export RCA_REGISTRY="ghcr.io/${{ steps.meta.outputs.owner }}"
+            export RCA_IMAGE_TAG="$TARGET"
+            echo "回滚到 $RCA_IMAGE_TAG ..."
+            docker compose pull
+            docker compose up -d
+
+            echo "等待服务就绪..."
+            for i in $(seq 1 30); do
+              UNHEALTHY=$(docker compose ps --format json | grep -v '"Health":"healthy"' | grep -c 'rca-' || true)
+              if [ "$UNHEALTHY" = "0" ]; then
+                echo "回滚完成，服务健康"
+                echo "$RCA_IMAGE_TAG" > .deployed_tag
+                exit 0
+              fi
+              sleep 5
+            done
+            echo "回滚后健康检查超时"
+            docker compose ps
+            docker compose logs --tail 50
+            exit 1

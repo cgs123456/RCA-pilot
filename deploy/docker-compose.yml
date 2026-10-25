@@ -4,8 +4,11 @@
 #   2. docker compose up -d
 #   3. 访问 http://localhost:8080
 #
-# 首次启动后初始化数据库：
+# 首次启动后初始化演示数据：
 #   docker compose --profile seed up seed
+#
+# 数据库迁移随 up -d 自动执行：migrate 一次性服务跑 alembic upgrade head，
+# 全部后端服务等待其成功完成后才启动（失败即整体不起，杜绝带伤上线）
 #
 # 本地开发（挂载源码热更新）：
 #   docker compose -f docker-compose.yml -f docker-compose.dev.yml up
@@ -21,11 +24,18 @@ x-backend-base: &backend-base
   restart: unless-stopped
   env_file: .env
   working_dir: /app
+  environment:
+    # H28 水平扩容：每个后端服务 2 个 uvicorn worker（dev reload 时自动退回单进程）
+    UVICORN_WORKERS: "2"
+    # 多 worker 下 /metrics 必须跨进程聚合（prometheus_client multiprocess 模式）
+    PROMETHEUS_MULTIPROC_DIR: /tmp/prom_metrics
   depends_on:
     postgres:
       condition: service_healthy
     redis:
       condition: service_healthy
+    migrate:
+      condition: service_completed_successfully
   healthcheck:
     test: ["CMD-SHELL", "python -c \"import os,urllib.request;urllib.request.urlopen('http://localhost:'+os.getenv('APP_PORT','8000')+'/health',timeout=3)\""]
     interval: 15s
@@ -43,20 +53,31 @@ services:
   # 数据层
   # ============================================================
   postgres:
-    image: postgres:15-alpine
+    image: pgvector/pgvector:pg15  # postgres 15 + pgvector（evidence 向量检索）
     container_name: rca-postgres
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-rca}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rca-secret}
+      # 防呆：密码必须在 .env 显式设置，缺失时 compose 直接报错而不是静默用默认弱口令
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env (copy from .env.example and change it)}
       POSTGRES_DB: ${POSTGRES_DB:-rca_pilot}
-    # 提高连接上限（9 个后端进程共享此实例）
-    command: ["postgres", "-c", "max_connections=200"]
+    # 提高连接上限（3 个后端单元 × 2 worker 共享此实例）；
+    # WAL 归档开启 PITR 能力（runbook 见 docs/RUNBOOK_BACKUP.md）：
+    # archive_command 把 WAL 段复制到挂载目录（宿主侧可再同步到异地存储）。
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=200"
+      - "-c"
+      - "archive_mode=on"
+      - "-c"
+      - "archive_command=test ! -f /wal-archive/%f && cp %p /wal-archive/%f"
     expose:
       - "5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ../backend/db/01_schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ./wal-archive:/wal-archive
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rca}"]
       interval: 5s
@@ -89,56 +110,63 @@ services:
         max-file: "3"
 
   # ============================================================
-  # 后端微服务
+  # 数据库迁移（一次性运行 —— 上线路径必须经过 alembic 版本化迁移）
+  # 兼容三类库状态：空库 / 由 01_schema.sql 引导（stamp head 后接管）/ 已版本化
   # ============================================================
-  auth-service:
+  migrate:
     <<: *backend-base
     build:
       context: ..
       dockerfile: deploy/Dockerfile.backend
-    image: ${RCA_REGISTRY:-rca-pilot}/auth-service:${RCA_IMAGE_TAG:-dev}
-    container_name: rca-auth
+    image: ${RCA_REGISTRY:-rca-pilot}/migrate:${RCA_IMAGE_TAG:-dev}
+    container_name: rca-migrate
+    restart: "no" # 一次性任务：exit 0 后不得被 anchor 的 unless-stopped 拉起
+    healthcheck:
+      disable: true
     environment:
-      SERVICE_NAME: auth-service
-      APP_PORT: "8001"
-    command: uvicorn auth_service.main:app --host 0.0.0.0 --port 8001 --proxy-headers
-    expose:
-      - "8001"
+      SERVICE_NAME: migrate
+    working_dir: /app/backend
+    command: ["python", "scripts/run_migrations.py"]
+    depends_on:
+      postgres:
+        condition: service_healthy
 
-  case-service:
+  # ============================================================
+  # 后端单元（P3-① 架构收敛：9 微服务 → 3 单元）
+  #   core-service      = auth + case + evidence + audit（业务 CRUD 单元）
+  #   agent-service     = 多 Agent LLM 流水线（独立单元：长任务/单 worker 隔离）
+  #   connector-gateway = LMS/BMS/EMS/MES 四个源系统连接器
+  # ============================================================
+  core-service:
     <<: *backend-base
     build:
       context: ..
       dockerfile: deploy/Dockerfile.backend
-    image: ${RCA_REGISTRY:-rca-pilot}/case-service:${RCA_IMAGE_TAG:-dev}
-    container_name: rca-case
+    image: ${RCA_REGISTRY:-rca-pilot}/core-service:${RCA_IMAGE_TAG:-dev}
+    container_name: rca-core
     environment:
-      SERVICE_NAME: case-service
-      APP_PORT: "8002"
-    command: uvicorn case_service.main:app --host 0.0.0.0 --port 8002 --proxy-headers
+      SERVICE_NAME: core-service
+      APP_PORT: "8000"
+      # P3-①：evidence_service 直连 connector-gateway（URL 默认值已收敛，显式声明便于覆盖）
+      LMS_CONNECTOR_URL: http://connector-gateway:8010
+      BMS_CONNECTOR_URL: http://connector-gateway:8010
+      EMS_CONNECTOR_URL: http://connector-gateway:8010
+      MES_CONNECTOR_URL: http://connector-gateway:8010
+      # B9 审计链外部锚定（audit 领域随 core 部署）
+      AUDIT_ANCHOR_PATH: /data/audit-anchor/anchor.jsonl
+    command: uvicorn core_service.main:app --host 0.0.0.0 --port 8000 --proxy-headers
+    volumes:
+      # B9 审计链外部锚定：WORM 追加文件，宿主侧应纳入备份与异地留存
+      - ./audit-anchor:/data/audit-anchor
     expose:
-      - "8002"
+      - "8000"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
-      auth-service:
-        condition: service_started
-
-  evidence-service:
-    <<: *backend-base
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile.backend
-    image: ${RCA_REGISTRY:-rca-pilot}/evidence-service:${RCA_IMAGE_TAG:-dev}
-    container_name: rca-evidence
-    environment:
-      SERVICE_NAME: evidence-service
-      APP_PORT: "8003"
-    command: uvicorn evidence_service.main:app --host 0.0.0.0 --port 8003 --proxy-headers
-    expose:
-      - "8003"
+      migrate:
+        condition: service_completed_successfully
 
   agent-service:
     <<: *backend-base
@@ -156,78 +184,19 @@ services:
     expose:
       - "8004"
 
-  audit-service:
+  connector-gateway:
     <<: *backend-base
     build:
       context: ..
       dockerfile: deploy/Dockerfile.backend
-    image: ${RCA_REGISTRY:-rca-pilot}/audit-service:${RCA_IMAGE_TAG:-dev}
-    container_name: rca-audit
+    image: ${RCA_REGISTRY:-rca-pilot}/connector-gateway:${RCA_IMAGE_TAG:-dev}
+    container_name: rca-connectors
     environment:
-      SERVICE_NAME: audit-service
-      APP_PORT: "8005"
-    command: uvicorn audit_service.main:app --host 0.0.0.0 --port 8005 --proxy-headers
+      SERVICE_NAME: connector-gateway
+      APP_PORT: "8010"
+    command: uvicorn connectors.gateway:app --host 0.0.0.0 --port 8010 --proxy-headers
     expose:
-      - "8005"
-
-  # ============================================================
-  # Connectors（4 个 —— BMS/EMS/MES 缺失会导致证据拉取失败）
-  # ============================================================
-  lms-connector:
-    <<: *backend-base
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile.backend
-    image: ${RCA_REGISTRY:-rca-pilot}/lms-connector:${RCA_IMAGE_TAG:-dev}
-    container_name: rca-lms-connector
-    environment:
-      SERVICE_NAME: lms-connector
-      APP_PORT: "8011"
-    command: uvicorn connectors.lms.main:app --host 0.0.0.0 --port 8011
-    expose:
-      - "8011"
-
-  bms-connector:
-    <<: *backend-base
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile.backend
-    image: ${RCA_REGISTRY:-rca-pilot}/bms-connector:${RCA_IMAGE_TAG:-dev}
-    container_name: rca-bms-connector
-    environment:
-      SERVICE_NAME: bms-connector
-      APP_PORT: "8012"
-    command: uvicorn connectors.bms.main:app --host 0.0.0.0 --port 8012
-    expose:
-      - "8012"
-
-  ems-connector:
-    <<: *backend-base
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile.backend
-    image: ${RCA_REGISTRY:-rca-pilot}/ems-connector:${RCA_IMAGE_TAG:-dev}
-    container_name: rca-ems-connector
-    environment:
-      SERVICE_NAME: ems-connector
-      APP_PORT: "8013"
-    command: uvicorn connectors.ems.main:app --host 0.0.0.0 --port 8013
-    expose:
-      - "8013"
-
-  mes-connector:
-    <<: *backend-base
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile.backend
-    image: ${RCA_REGISTRY:-rca-pilot}/mes-connector:${RCA_IMAGE_TAG:-dev}
-    container_name: rca-mes-connector
-    environment:
-      SERVICE_NAME: mes-connector
-      APP_PORT: "8014"
-    command: uvicorn connectors.mes.main:app --host 0.0.0.0 --port 8014
-    expose:
-      - "8014"
+      - "8010"
 
   # ============================================================
   # 前端（nginx 反代 + 静态资源，非 root 镜像监听 8080）
@@ -242,11 +211,9 @@ services:
     ports:
       - "8080:8080"
     depends_on:
-      - auth-service
-      - case-service
-      - evidence-service
+      - core-service
       - agent-service
-      - audit-service
+      - connector-gateway
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
       interval: 15s
@@ -259,7 +226,7 @@ services:
         max-file: "3"
 
   # ============================================================
-  # 数据库备份（GxP: 数据保留 10 年 —— 每日 pg_dump 落盘）
+  # 数据库备份（GxP: 数据保留 10 年 —— 每日 pg_dump 落盘，默认随栈启动）
   # ============================================================
   db-backup:
     image: postgres:15-alpine
@@ -267,7 +234,7 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      PGPASSWORD: ${POSTGRES_PASSWORD:-rca-secret}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env (copy from .env.example and change it)}
     volumes:
       - ./backups:/backups
     depends_on:
@@ -283,7 +250,7 @@ services:
           find /backups -name "*.dump" -mtime +${BACKUP_RETENTION_DAYS:-30} -delete;
           sleep 86400;
         done'
-    profiles: ["backup"]  # 按需启用：docker compose --profile backup up -d db-backup
+    # GxP 备份属强制项，不再挂在 profile 后按需启用（2026-10-25 审查 C17）
 
   # ============================================================
   # 数据库初始化（一次性运行）
@@ -304,6 +271,31 @@ services:
         condition: service_healthy
     profiles: ["seed"]  # 仅在 docker compose --profile seed up 时运行
 
+  # ============================================================
+  # 监控 —— Prometheus（指标抓取 + 告警规则评估；Grafana 可视化属后续阶段）
+  # 告警规则见 deploy/prometheus-alerts.yml（规则名与 shared/metrics.py 导出指标一一对应）
+  # ============================================================
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: rca-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus-alerts.yml:/etc/prometheus/prometheus-alerts.yml:ro
+      - prometheus_data:/prometheus
+    expose:
+      - "9090"
+    depends_on:
+      - core-service
+      - agent-service
+      - connector-gateway
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
 volumes:
   postgres_data:
   redis_data:
+  prometheus_data:

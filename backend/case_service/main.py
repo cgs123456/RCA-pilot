@@ -5,11 +5,17 @@ import os
 
 import uvicorn
 
+from case_service.capa_routes import router as capa_router
+from case_service.notification_routes import router as notification_router
+from case_service.report_routes import router as report_router
 from case_service.routes import router
 from shared.service_base import create_app
 
 app = create_app("case-service")
 app.include_router(router, prefix="/api/v1")
+app.include_router(capa_router, prefix="/api/v1")
+app.include_router(report_router, prefix="/api/v1")
+app.include_router(notification_router, prefix="/api/v1")
 
 
 if __name__ == "__main__":
@@ -18,6 +24,8 @@ if __name__ == "__main__":
         "case_service.main:app",
         host="0.0.0.0",
         port=port,
-        reload=os.getenv("ENV") == "dev",
+        reload=(reload_flag := os.getenv("ENV") == "dev"),
+        # H28 水平扩容：经 UVICORN_WORKERS 开多 worker（与 dev 的 reload 互斥）
+        workers=1 if reload_flag else max(1, int(os.getenv("UVICORN_WORKERS", "1"))),
         log_config=None,
     )

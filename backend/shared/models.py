@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -15,6 +16,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -42,6 +44,14 @@ class User(Base):
     shift: Mapped[str | None] = mapped_column(String(20))
     cert: Mapped[str | None] = mapped_column(Text)
     password_hash: Mapped[str | None] = mapped_column(String(200))  # 内置登录用（生产对接 OIDC）
+    # P3-④ TOTP 第二因子：secret 非空且 pending=False 时登录要求动态验证码
+    totp_secret: Mapped[str | None] = mapped_column(String(64))
+    totp_pending: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False, server_default=text("false")
+    )
+    totp_last_step: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False, server_default=text("0")
+    )  # 防同窗口重放
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     failed_login_attempts: Mapped[int] = mapped_column(Integer, default=0)
     locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)  # 锁定截止时间（时间窗自动解锁）
@@ -72,6 +82,16 @@ class Deviation(Base):
     # Minor + complexity=3 → major
     # 否则保持原 severity
     case_type: Mapped[str | None] = mapped_column(String(100))  # EM + HVAC + 培训
+    # P2-⑧ 偏差类型分级（OOS/OOT 联动基础）：process_deviation|lab_oos|lab_oot|complaint|equipment|environment|other
+    deviation_type: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="process_deviation",
+        server_default=text("'process_deviation'"), index=True,
+    )
+    # P2-⑧ 批次影响评估：受影响批号列表（生产/检验记录可按批号追溯）
+    # server_default 不带 ::jsonb cast —— 字面量由 PG 按列类型自动转换，且 SQLite 测试库 create_all 可直接渲染
+    affected_batches: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'")
+    )
     complexity: Mapped[int] = mapped_column(Integer, default=1)  # 1-3
     location: Mapped[str | None] = mapped_column(String(200))
     area: Mapped[str | None] = mapped_column(String(200))
@@ -127,8 +147,12 @@ class Evidence(Base):
     content_hash: Mapped[str] = mapped_column(String(80), nullable=False)  # sha256:xxx
     confidence: Mapped[int] = mapped_column(Integer, default=3)  # 1-4
     is_signed: Mapped[bool] = mapped_column(Boolean, default=False)
-    # 语义检索字段（Phase 2 新增）—— embedding 向量以 JSON 数组存储，避免引入 sqlite-vec/Chroma 依赖
+    # 语义检索字段（Phase 2）—— embedding JSONB 是 source of truth；
+    # embedding_vec（pgvector，20261025_0006 建列+回填）是检索副本，embed 时双写。
+    # 无维度 vector 列：多 provider 维度不一（GLM 2048/Qwen 1024/OpenAI 1536），
+    # 固定维度列写不进；检索 SQL 里用 vector_dims 过滤保证不混维比较。
     embedding: Mapped[list[float] | None] = mapped_column(JSONB, nullable=True)
+    embedding_vec: Mapped[list[float] | None] = mapped_column(Vector, nullable=True)
     embedding_model: Mapped[str | None] = mapped_column(String(80), nullable=True)
     embedded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
@@ -259,6 +283,15 @@ class AgentRun(Base):
 
     __table_args__ = (
         Index("ix_agentruns_status", "status"),
+        # DB 级兜底：同案例同时只允许一条活跃流水线（与应用层 ACTIVE_RUN_STATUSES 对齐，
+        # 防止查重 SELECT 与 INSERT 之间的并发竞态；WHERE 子句与 models 注释同步维护）
+        Index(
+            "uq_agentruns_one_active_per_case",
+            "case_id",
+            unique=True,
+            sqlite_where=text("status IN ('pending', 'running')"),
+            postgresql_where=text("status IN ('pending', 'running')"),
+        ),
     )
 
 
@@ -292,10 +325,13 @@ class SignatureRecord(Base):
     certificate_fingerprint: Mapped[str | None] = mapped_column(String(80))
     ip_address: Mapped[str | None] = mapped_column(String(50))
     confirmation_text: Mapped[str] = mapped_column(Text, default="我确认本电子签名等同于手写签名，所提交内容真实准确")
+    # 受控修订轮次（reopen 计数）：0=首次签署；结案重审后重新签署属新修订，
+    # 唯一约束含 revision 使同一签字人在不同修订轮次可再次签署（旧签名记录不可篡改地保留）
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
 
     __table_args__ = (
-        # 同一用户对同一案例同一含义只能签一次（Part 11 签名唯一性）
-        UniqueConstraint("case_id", "signature_meaning", "signer_id", name="signatures_case_meaning_signer_uniq"),
+        # 同一用户对同一案例同一含义同一修订轮次只能签一次（Part 11 签名唯一性）
+        UniqueConstraint("case_id", "signature_meaning", "signer_id", "revision", name="signatures_case_meaning_signer_uniq"),
     )
 
 
@@ -367,4 +403,29 @@ class Report(Base):
         UniqueConstraint("case_id", "version", name="reports_case_version_uniq"),
         Index("ix_reports_case_id", "case_id"),
         Index("ix_reports_status", "status"),
+    )
+
+
+class Notification(Base):
+    """P2-⑧ 站内协作通知 — 最小闭环（ assignment / 结案 / CAPA / 关卡就绪）"""
+
+    __tablename__ = "notifications"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)  # NTF-{uuid12}
+    user_id: Mapped[str] = mapped_column(String(32), ForeignKey("users.id"), nullable=False)
+    case_id: Mapped[str | None] = mapped_column(String(32), ForeignKey("deviations.id"))
+    type: Mapped[str] = mapped_column(String(50), nullable=False)
+    # CASE_ASSIGNED|CASE_CLOSED|CAPA_CREATED|GATE_READY
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    __table_args__ = (
+        Index("ix_notifications_user_created", "user_id", "created_at"),
+        # 未读徽章计数热路径；postgresql_where 在 SQLite（测试库）被忽略为普通索引
+        Index(
+            "ix_notifications_unread",
+            "user_id",
+            postgresql_where=text("read_at IS NULL"),
+        ),
     )

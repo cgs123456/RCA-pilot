@@ -66,3 +66,30 @@ groups:
         annotations:
           summary: "DB 连接池使用率超过 90%: {{ $labels.service }}"
           description: "连接池接近耗尽，请求将排队或超时。"
+
+      - alert: JtiBlacklistFailOpen
+        expr: increase(rca_jti_failopen_total[10m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "jti 黑名单降级放行：{{ $labels.op }}"
+          description: "Redis 不可用或写入失败，登出/封禁的会话在降级期间仍可通过鉴权（21 CFR Part 11 关注项），请立即恢复 Redis 并评估是否强制全员重登。"
+
+      - alert: LlmCallFailureRateHigh
+        expr: >
+          sum(increase(rca_llm_calls_total{outcome!="success"}[30m]))
+          / clamp_min(sum(increase(rca_llm_calls_total[30m])), 1) > 0.3
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LLM 调用失败率超过 30%（30 分钟窗口）"
+          description: "LLM 服务异常或配置漂移；流水线已自动降级规则模板，请检查 provider 可用性并按 docs/COU.md 第 6 节评审漂移。"
+
+      - alert: LlmCostSpike
+        expr: sum(increase(rca_llm_cost_estimated_cny_total[24h])) > 500
+        labels:
+          severity: warning
+        annotations:
+          summary: "24 小时 LLM 估算成本超过 500 CNY"
+          description: "单案 token 用量可能异常（漂移信号之一，见 docs/COU.md 第 6 节），请核查是否有失控重试或超大案例。"

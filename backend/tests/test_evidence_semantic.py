@@ -205,6 +205,54 @@ class TestVectorSearch:
         results = await vector_search(test_db, query_embedding=[1.0], top_k=10)
         assert results == []
 
+    async def test_vector_search_filters_by_embedding_model(
+        self, test_db: AsyncSession, semantic_case
+    ):
+        """不同 embedding_model 的向量不可比，必须按模型过滤"""
+        from shared.vector_store import vector_search
+
+        for ev_id in ["E-SEM-01", "E-HIST-01"]:
+            ev = await test_db.get(Evidence, ev_id)
+            assert ev is not None
+            ev.embedding = [1.0, 0.0]
+            ev.embedding_model = "glm-embedding-3"
+        other = await test_db.get(Evidence, "E-SEM-02")
+        assert other is not None
+        other.embedding = [1.0, 0.0]
+        other.embedding_model = "qwen-embedding-v4"
+        await test_db.commit()
+
+        results = await vector_search(
+            test_db, query_embedding=[1.0, 0.0], top_k=10,
+            embedding_model="glm-embedding-3",
+        )
+
+        ev_ids = {r.evidence_id for r in results}
+        assert "E-SEM-02" not in ev_ids  # 其他模型的向量被过滤
+        assert "E-SEM-01" in ev_ids
+
+    async def test_vector_search_warns_when_candidates_truncated(
+        self, test_db: AsyncSession, semantic_case, caplog
+    ):
+        """降级路径候选超上限时显式告警（H20：旧证据不再静默丢失）"""
+        import logging as _logging
+
+        from shared.vector_store import vector_search
+
+        ev = await test_db.get(Evidence, "E-SEM-01")
+        assert ev is not None
+        ev.embedding = [1.0, 0.0]
+        await test_db.commit()
+
+        with caplog.at_level(_logging.WARNING, logger="vector-store"):
+            # 候选 1 条 > 上限 0 条，必触发告警
+            results = await vector_search(
+                test_db, query_embedding=[1.0, 0.0], top_k=10, max_candidates=0
+            )
+        assert any("超过降级路径上限" in r.getMessage() for r in caplog.records)
+        # 上限为 0 → 不加载任何候选 → 无结果
+        assert results == []
+
 
 class TestKeywordSearch:
     """关键词搜索（降级路径）"""

@@ -124,7 +124,7 @@ def _hash_user_id(user_id: str) -> int:
     """对 user_id 做稳定 hash（0-99），用于百分比灰度"""
     import hashlib
 
-    h = hashlib.md5(user_id.encode("utf-8")).hexdigest()
+    h = hashlib.md5(user_id.encode("utf-8"), usedforsecurity=False).hexdigest()
     return int(h[:8], 16) % 100
 
 

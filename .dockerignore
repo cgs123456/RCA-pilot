@@ -1,0 +1,33 @@
+# RCA Pilot Docker 构建上下文排除清单（根级，backend/frontend 两个镜像共用同一 context）
+# 原则：镜像内需要什么才允许进 context —— 依赖一律镜像内重装，本地产物/密钥绝不进入镜像层
+
+# ---- 版本控制 / CI ----
+.git
+.gitignore
+.github
+
+# ---- Node 产物 ----
+# 镜像内由 npm ci 重装；宿主 node_modules 会覆盖镜像内依赖（esbuild/rollup 等平台二进制可能不匹配）
+frontend/node_modules
+frontend/dist
+frontend/coverage
+
+# ---- Python 本地产物（镜像内 pip install 重建）----
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/.venv
+**/htmlcov
+**/.coverage
+**/.coverage.*
+
+# ---- 本地环境与密钥：绝不进入镜像层 ----
+.env
+.env.*
+
+# ---- 文档与压测脚本（运行镜像不需要）----
+docs
+k6
+*.md

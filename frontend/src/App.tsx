@@ -2,7 +2,7 @@
  * App 根组件 — 路由（懒加载）+ 认证守卫
  */
 import { lazy, Suspense } from 'react';
-import { Routes, Route, Navigate } from 'react-router-dom';
+import { Routes, Route, Navigate, Link } from 'react-router-dom';
 import { useAuthStore } from '@/stores/auth.store';
 import { AppShell } from '@/components/AppShell';
 import { FlaskConical, FileText, BookOpen, Settings, Loader2 } from 'lucide-react';
@@ -23,6 +23,9 @@ const InvestigationPage = lazy(() =>
 const AuditPage = lazy(() =>
   import('@/pages/AuditPage').then((m) => ({ default: m.AuditPage }))
 );
+const SecurityPage = lazy(() =>
+  import('@/pages/SecurityPage').then((m) => ({ default: m.SecurityPage }))
+);
 const PlaceholderPage = lazy(() =>
   import('@/pages/PlaceholderPage').then((m) => ({ default: m.PlaceholderPage }))
 );
@@ -40,6 +43,18 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
   if (!isAuthenticated) return <Navigate to="/login" replace />;
   return <>{children}</>;
+}
+
+function NotFound() {
+  return (
+    <div className="flex h-64 flex-col items-center justify-center gap-3 text-center">
+      <p className="text-4xl font-bold text-ink-200">404</p>
+      <p className="text-sm text-ink-400">页面不存在或已被移除</p>
+      <Link to="/dashboard" className="text-sm text-blue-600 hover:underline">
+        返回工作台
+      </Link>
+    </div>
+  );
 }
 
 export default function App() {
@@ -65,6 +80,7 @@ export default function App() {
                   <Route path="/inbox" element={<InboxPage />} />
                   <Route path="/investigation/:caseId" element={<InvestigationPage />} />
                   <Route path="/audit" element={<AuditPage />} />
+                  <Route path="/security" element={<SecurityPage />} />
                   <Route
                     path="/evidence"
                     element={
@@ -106,6 +122,7 @@ export default function App() {
                     }
                   />
                   <Route path="/" element={<Navigate to="/dashboard" replace />} />
+                  <Route path="*" element={<NotFound />} />
                 </Routes>
               </Suspense>
             </AppShell>

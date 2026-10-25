@@ -45,9 +45,9 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_access_ttl_minutes: int = 15
     jwt_refresh_ttl_days: int = 7
-    # MFA：代码尚未实现 TOTP 校验（auth_service 登录流程不消费 mfa_code），
-    # 默认必须为 False，否则构成"声明与实现不符"的 GxP 审计发现。
-    # 实现 TOTP 后再改回 True。
+    # MFA：TOTP 已实现（shared/totp.py + /auth/totp/*，登录对已启用用户强制校验）。
+    # 本开关表示"全员必须启用 TOTP"的治理策略：True 时由运维巡检/GRC 流程
+    # 监督所有用户完成注册（登录逻辑仍只对已启用用户要求验证码）。
     mfa_required: bool = False
     # 会话锁定：连续失败锁定时长（分钟），0 表示永久锁定（不推荐）
     account_lockout_minutes: int = 15
@@ -73,21 +73,29 @@ class Settings(BaseSettings):
     mes_connector_port: int = 8014
 
     # ---- 服务发现（Docker Compose 内服务名）----
-    auth_service_url: str = "http://auth-service:8001"
-    case_service_url: str = "http://case-service:8002"
-    evidence_service_url: str = "http://evidence-service:8003"
+    # P3-① 架构收敛后仅两个后端单元：core-service（auth+case+evidence+audit）
+    # 与 agent-service（LLM 流水线独立单元）；agent_service_url 被 gate3 自动重试使用。
     agent_service_url: str = "http://agent-service:8004"
-    audit_service_url: str = "http://audit-service:8005"
-    lms_connector_url: str = "http://lms-connector:8011"
-    bms_connector_url: str = "http://bms-connector:8012"
-    ems_connector_url: str = "http://ems-connector:8013"
-    mes_connector_url: str = "http://mes-connector:8014"
+    # 四个 connector 收敛到 connector-gateway 单容器；路由前缀含 /api/v1
+    # （历史缺陷：evidence_service 拼接 URL 曾漏 /api/v1 导致线上 404，测试 mock 未暴露）
+    lms_connector_url: str = "http://connector-gateway:8010"
+    bms_connector_url: str = "http://connector-gateway:8010"
+    ems_connector_url: str = "http://connector-gateway:8010"
+    mes_connector_url: str = "http://connector-gateway:8010"
 
     # ---- GxP 合规 ----
     audit_log_immutable: bool = True
     session_timeout_minutes: int = 15
     require_dual_signature: bool = True
     retention_years: int = 10
+    # B9 审计链外部锚定：链头定期追加写入该 WORM 文件（0 = 关闭周期锚定）
+    audit_anchor_path: str = "/data/audit-anchor/anchor.jsonl"
+    audit_anchor_interval_seconds: int = 600
+
+    # C7 流水线 DB 轮询 worker（agent-service 内）：pending run 的持久化执行
+    agent_worker_enabled: bool = True
+    agent_worker_poll_seconds: float = 1.0
+    agent_pipeline_concurrency: int = 2  # 同时执行的流水线上限
 
     # ---- LLM (Phase 2 启用) ----
     # provider 支持：glm (智谱) | qwen (阿里通义) | openai | anthropic | azure | "" (禁用)
@@ -100,6 +108,8 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.2  # Reasoner 推理温度，偏低保证可复现性
     llm_timeout_seconds: int = 30  # HTTP 超时
     llm_max_retries: int = 2  # 失败重试次数（指数退避）
+    llm_max_concurrency: int = 8  # 单客户端在途请求上限（防止流水线并发打爆上游配额）
+    llm_json_reprompts: int = 1  # chat_json 校验失败后的修复性重问次数
 
     # ---- LLM 多 Agent 博弈（Phase 2 改进5） ----
     # 对抗 Reasoner 使用的 secondary LLM，留空则降级到单 Reasoner

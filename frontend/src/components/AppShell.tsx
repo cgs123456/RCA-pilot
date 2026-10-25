@@ -6,11 +6,12 @@ import { useQueryClient } from '@tanstack/react-query';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import {
   LayoutDashboard, Inbox, FlaskConical, FileText, ShieldCheck,
-  BookOpen, Settings, LogOut, Menu, X, Search, Bell,
+  BookOpen, Settings, LogOut, Menu, X, Search,
   ChevronRight, Activity,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/auth.store';
 import { cn, roleLabel } from '@/lib/utils';
+import { NotificationBell } from '@/components/NotificationBell';
 
 // 各角色可见的导航分组（仅前端视觉控制；权限硬校验在后端 RBAC）
 const ROLE_NAV: Record<string, string[] | 'all'> = {
@@ -144,9 +145,14 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             <button className="p-1.5 rounded hover:bg-ink-100" title="搜索">
               <Search className="w-4 h-4 text-ink-500" />
             </button>
-            <button className="p-1.5 rounded hover:bg-ink-100 relative" title="通知">
-              <Bell className="w-4 h-4 text-ink-500" />
-              <span className="absolute top-1 right-1 w-1.5 h-1.5 bg-danger-500 rounded-full" />
+            {/* P2-⑧ 站内协作通知：未读徽章 + 下拉面板 */}
+            <NotificationBell />
+            <button
+              onClick={() => navigate('/security')}
+              className="p-1.5 rounded hover:bg-ink-100"
+              title="安全设置（两步验证）"
+            >
+              <ShieldCheck className="w-4 h-4 text-ink-500" />
             </button>
 
             <div className="h-6 w-px bg-ink-200" />
