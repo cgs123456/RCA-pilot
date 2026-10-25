@@ -1277,6 +1277,13 @@ uvicorn[standard]==0.30.6 \
     --hash=sha256:4b15decdda1e72be08209e860a1e10e92439ad5b97cf44cc945fcbee66fc5788 \
     --hash=sha256:65fd46fe3fda5bdc1b03b94eb634923ff18cd35b2f084813ea79d1f103f711b5
     # via -r requirements.txt
+uvloop==0.23.0 ; sys_platform != "win32" \
+    --hash=sha256:8fcd721113260ffb5e38bf14a8725b17d431f34209f7d1c7005b667946e630b3 \
+    --hash=sha256:ab17b3a8aa754be0de0e397f7b95f13b14e56f077a4c6ae295e3d4afd199b325 \
+    --hash=sha256:80cac5cb90ed7b9b72a217a1d6982b15b829cdbd0ee6bc19b93e3a9e47fb0ac9 \
+    --hash=sha256:93087a845cdfb35753e539354ac9551bdd2ff528c202a98df0ae46e852bcf021 \
+    --hash=sha256:28d160f51ab4da3b187063652e643dea6831072add4adc1e6d62afbe73b6be27
+    # via uvicorn[standard]
 watchfiles==1.3.0 \
     --hash=sha256:000b9688fc8133037a8b075c8ebf98f32844ff8964dda61e85c1db547dafc441 \
     --hash=sha256:025b108f2d5cc2799cb941f79380df3e8b22bfb589c218e801767fe78d598c95 \
