@@ -176,8 +176,28 @@ jobs:
           cosign verify --certificate-identity-regexp "$IDENTITY" --certificate-oidc-issuer "$ISSUER" \
             "ghcr.io/${{ steps.meta.outputs.owner }}/frontend@${{ needs.build-and-push-images.outputs.frontend_digest }}"
 
+      # staging 凭据是操作者侧配置：未配置时跳过 SSH 部署保持流水线绿色，
+      # 而不是报 "missing server host" 假失败；配置后本步骤自动开始真实部署
+      - name: 检查部署凭据是否已配置
+        id: guard
+        env:
+          STAGING_SSH_HOST: ${{ secrets.STAGING_SSH_HOST }}
+          STAGING_SSH_USER: ${{ secrets.STAGING_SSH_USER }}
+          STAGING_SSH_PRIVATE_KEY: ${{ secrets.STAGING_SSH_PRIVATE_KEY }}
+          STAGING_DEPLOY_PATH: ${{ secrets.STAGING_DEPLOY_PATH }}
+        run: |
+          if [ -n "$STAGING_SSH_HOST" ] && [ -n "$STAGING_SSH_USER" ] && \
+             [ -n "$STAGING_SSH_PRIVATE_KEY" ] && [ -n "$STAGING_DEPLOY_PATH" ]; then
+            echo "configured=true" >> $GITHUB_OUTPUT
+            echo "部署凭据齐全，继续 SSH 部署"
+          else
+            echo "configured=false" >> $GITHUB_OUTPUT
+            echo "::notice::未配置 STAGING_SSH_HOST / STAGING_SSH_USER / STAGING_SSH_PRIVATE_KEY / STAGING_DEPLOY_PATH，跳过 Staging 部署。在仓库 Settings → Secrets and variables → Actions 添加后，下次 CD 将自动执行真实部署。"
+          fi
+
       - name: SSH 部署到 staging 服务器
         id: deploy
+        if: steps.guard.outputs.configured == 'true'
         uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
         with:
           host: ${{ secrets.STAGING_SSH_HOST }}
@@ -221,7 +241,7 @@ jobs:
             exit 1
 
       - name: 部署失败自动回滚到上一版本
-        if: failure()
+        if: failure() && steps.guard.outputs.configured == 'true'
         uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
         with:
           host: ${{ secrets.STAGING_SSH_HOST }}
