@@ -48,4 +48,4 @@ sentry-sdk[fastapi]==2.18.0  # 异常捕捉
 # ============================================================
 # Feature Flag（Phase 2c 灰度发布）
 # ============================================================
-unleashclient==6.1.0        # Unleash SDK，可对接自建 Unleash 服务
+unleashclient==6.9.1        # Unleash SDK，可对接自建 Unleash 服务
