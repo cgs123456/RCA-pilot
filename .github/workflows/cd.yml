@@ -121,7 +121,7 @@ jobs:
 
       # GxP 供应链：keyless 签名 —— 按 digest 签一次，指向该 digest 的全部 tag 同时生效
       - name: 安装 cosign
-        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3.10.1
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v3.10.1
 
       - name: cosign 签名后端镜像
         run: cosign sign --yes "ghcr.io/${{ steps.meta.outputs.owner }}/core-service@${{ steps.backend-push.outputs.digest }}"
@@ -164,7 +164,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: 安装 cosign
-        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3.10.1
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v3.10.1
 
       # GxP 供应链：只部署本流水线构建并签名过的镜像
       - name: cosign 验签（未签名或非本流水线签发的镜像禁止部署）
