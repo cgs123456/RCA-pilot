@@ -2,7 +2,7 @@
 # 多阶段构建：编译工具链只存在于 builder，运行时镜像不含 gcc/头文件
 
 # ---------- builder：编译安装 Python 依赖 ----------
-FROM python:3.11-slim AS builder
+FROM python:3.15-slim AS builder
 
 WORKDIR /build
 
@@ -26,7 +26,7 @@ COPY backend/requirements.lock /build/requirements.lock
 RUN pip install --no-cache-dir --prefix=/install --require-hashes -r requirements.lock
 
 # ---------- runtime：精简运行时镜像 ----------
-FROM python:3.11-slim
+FROM python:3.15-slim
 
 WORKDIR /app
 
